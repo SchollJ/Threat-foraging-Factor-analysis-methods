@@ -1,0 +1,2005 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+We perform here:
+- Factor analysis of questionnaires on replication data (applied then to discovery data)
+- Machine learning linking task to questionnaire factors (making out-of-sample predictions on discovery data)
+
+We compare different ways of extracting the factor scores:
+- how they correlate
+- how well they capture the original data structure
+- how good the out-of-sample predictions are
+
+# Load and libraries
+```{r}
+rm(list=ls())
+
+paths=list(base.path   ='/Users/jacquelinescholl/Documents/Experiments/Foraging_online/Threat-foraging-Factor-analysis-methods')
+paths$results   = file.path(paths$base.path,'Results')
+paths$imputedData =file.path(paths$base.path,'Imputed_MachineLearning')
+dir.create(paths$imputedData,showWarnings = FALSE)
+dir.create(paths$results,showWarnings = FALSE)
+nperm=10000# for permutation tests (so that we know how to correctly report stats if the p value is zero)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library('rstan')
+options(mc.cores= parallel::detectCores())
+rstan_options(auto_write= TRUE)
+library(foreach)
+library(doParallel)
+library(brms)
+library(sjPlot)
+library(ggpubr)
+library(stringr)
+library(DescTools)
+library(mice)# imputation
+library(mifa) # imputation for factor analysis
+library(ggcorrplot) # for plotting correlations
+library(psych)
+#source('fit_behaviour.R')
+#source('func_loadPreprocessedData.R')
+library(rstatix)
+library(lavaan)
+library(openxlsx)  # to open excel sheet 
+
+# Load the data
+data.repl=left_join(read.csv(file.path(paths$base.path,'Data','Behaviour_summarized_replication.csv')) %>%
+                      dplyr::select(-X,-contains('fitted.ok')),
+                    read.csv(file.path(paths$base.path,'Data','QuestionnaireSubscales_replication.csv')) %>%
+                      dplyr::select(-X), by='ID') 
+data.disc=left_join(read.csv(file.path(paths$base.path,'Data','Behaviour_summarized_discovery.csv')) %>%
+                      dplyr::select(-X,-contains('fitted.ok')),
+                    read.csv(file.path(paths$base.path,'Data','QuestionnaireSubscales_discovery.csv')) %>%
+                      dplyr::select(-X), by='ID') 
+ques.raw.disc = read.csv(file.path(paths$base.path,'Data','Questionnaires_cleaned_discovery.csv'))
+ques.raw.repl = read.csv(file.path(paths$base.path,'Data','Questionnaires_cleaned_replication.csv'))
+subsc_demogr= colnames(read.csv(file.path(paths$base.path,'Data','QuestionnaireSubscales_discovery.csv')) %>% dplyr::select(-ID,-X))
+
+
+
+```
+
+# Functions
+
+plots.fa=func.plotFA(factor.analysis.removedItems.this,paste('Repl - Reduced items'),use.newLabels = use.newLabels)
+
+```{r}
+func.plotFA=function(myFaT,this.title,use.ordering=FALSE,use.colors=FALSE,use.newLabels=FALSE,use.ordering.factors=FALSE,names.to.use=FALSE){ # add later: names to use?
+  t1=data.frame(unclass(myFaT$loadings)) %>%  tibble::rownames_to_column()
+  if (length(use.ordering)>1 ){
+    t1=t1 %>% dplyr::mutate(rowname=factor(rowname,ordered=TRUE,levels=use.ordering$measures)) %>% dplyr::arrange((rowname))
+  }
+  #ord=colnames(myData.withShortNames) 
+ # t3=data.table(t1,keep.rownames=TRUE)
+  #t3$rn=factor(t3$rn,levels=ord)
+  #t2B=melt.data.table(t3,id.vars="rn",variable.name="factors",value.name="loadings") # could have used 'gather' or 'melt' (from reshape2 or the new pivot_longer from dplyr...)
+  t2B = t1 %>%pivot_longer(-rowname,names_to='factors',values_to='loadings') 
+  if (all(names.to.use!=FALSE)){
+    t2B=left_join(t2B,names.to.use,by=c('factors'='GLS')) %>% dplyr::select(-factors) %>% dplyr::rename(factors=name)
+  }
+  
+  #t2B$factors=recode_factor(t2B$factors,`GLS2`="Compulsivity",`GLS4`="Apathy",`GLS1`="DeprAnx",`GLS3`="SocialAnx") # relabel factors
+  # order factors 
+  if (length(use.ordering.factors)!=1){
+    t2B=t2B %>% dplyr::mutate(factors=factor(factors,ordered=TRUE,levels=use.ordering.factors))
+  }
+  # makes a plot where different factors are as facets
+  
+  plot=ggplot(t2B,aes(rowname,(loadings),fill=loadings)) +
+    facet_wrap(~ factors, nrow=1,labeller = labeller(use.newLabels)) +
+    geom_bar(stat="identity",aes(fill=abs(loadings)>0.4))+
+    scale_fill_manual("legend",values=c("TRUE"="black","FALSE"="grey"))+
+    coord_flip()+
+    ylab("Loading strength") +
+    theme_minimal(base_size=10)+xlab("")
+  
+  # make the plot prettier
+  plot=plot+
+    theme(legend.position="none",axis.text.x=element_text(size=10),axis.text.y=element_text(size=10),text = element_text(size=10),strip.text = element_text(size = 10,face="bold"))+
+    ggtitle(this.title)
+  
+ 
+  # change labels
+  if (length(use.newLabels)!=1){
+    #plot=plot+scale_x_discrete(labels=use.newLabels)
+   browser()
+  }
+  
+  # change colours
+  if (length(use.colors)!=1){
+  plot=plot+
+  theme(axis.text.y = element_text(hjust = 1, colour = use.colors$color))
+  }
+  
+  
+  # print to screen
+  # print(plot.factors.confirmatorySample+theme(legend.position="none",axis.text.x=element_text(size=10),axis.text.y=element_text(size=10),text = element_text(size=10),strip.text = element_text(size = 10,face="bold"))+ggtitle("Factor analysis for full confirmation sample"))
+  # 
+  return(plot)
+}
+
+
+func.fitBRMS=function(df,this.formula){
+  # Preprocess: if gender, remove middle 'gender' and use bernoulli
+  if (stringr::str_split(this.formula,'~')[[1]][1]=='Gender.numeric'){
+    df=df %>% dplyr::filter(Gender.numeric==min(Gender.numeric)| Gender.numeric==max(Gender.numeric)) %>%
+      dplyr::mutate(Gender.numeric=round(Gender.numeric)) %>% dplyr::mutate(Gender.numeric=factor(Gender.numeric)) %>%
+      dplyr::mutate(Gender.numeric=recode_factor(Gender.numeric,`-1`='Female',`1`='Male')) %>%
+      dplyr::mutate_if(is.numeric,scale)
+    this.family='bernoulli'
+  } else{
+    this.family='gaussian'
+  }
+  # detect the simple model and adjust the prior
+  if (length(stringr::str_split(this.formula,'~')[[1]][2])==1){
+    this.prior=prior(normal(0,1),class='Intercept')
+  } else{
+    this.prior=c(prior(normal(0,1),class='Intercept'),
+                     prior(horseshoe(par_ratio=0.2),class='b'))
+  }
+  # fit the BRMS model
+  model=brm(formula=this.formula,
+             data=df,
+             family=this.family,
+             prior=this.prior, # assuming 20% of regressors might be significant 
+             control=list(adapt_delta=0.99,max_treedepth=12), # apparently adapt_delta above 0.99 and max_treedepth above 12 is unlikely to yield further improvements
+             chains=4,iter=4000,
+             refresh=0,
+             save_pars = save_pars(all = TRUE))
+  return(model)
+}
+
+func.makePrediction_rawTask = function (df,model,imodel.type,q.factors){
+  if (imodel.type=='TrainWithoutOtherClin'){
+     pred=as.data.frame(predict(model,newdata=df))
+  } else{
+    # we need to manually create a prediction without any of the other clinicla
+    t=as.data.frame(fixef(model))  %>% tibble::rownames_to_column()
+    pred=data.frame(matrix(NA, nrow = nrow(df), ncol = 0))
+    task.x = setdiff(t$rowname,c('Intercept',q.factors))
+    for (ireg in task.x){
+      pred[[paste0(ireg,'.mult')]] = df[[ireg]] * t %>% dplyr::filter(rowname==ireg) %>% pull(Estimate)
+      
+    }
+    if (as.character(model$formula$formula[[2]])=='Gender.numeric'){ # need to use invLogit
+      pred=pred %>% dplyr::mutate(EstimateT= rowSums(across(where(is.numeric))),
+                                  Estimate = 1/(1+exp(-EstimateT)))%>% ungroup() %>% dplyr::select(Estimate)
+    } else{
+      pred=pred %>% dplyr::mutate(Estimate= rowSums(across(where(is.numeric))))
+    }
+  }
+     
+  return(pred)
+  
+}
+
+func.getPredStatGender=function(df.withTrue,nperm){
+  #nperm=10000
+  df=    df.withTrue %>%  
+    dplyr::mutate(Gender.numeric_true=round(Gender.numeric_true)) %>% dplyr::mutate(Gender.numeric_true=factor(Gender.numeric_true)) %>%
+    dplyr::mutate(Gender.numeric_true=recode_factor(Gender.numeric_true,`-1`='Female',`1`='Male'))  %>%
+    dplyr::mutate(correct = case_when(Gender.numeric>0.5 & Gender.numeric_true=='Male' ~ 1,
+                                      Gender.numeric<0.5 & Gender.numeric_true=='Female' ~ 1,
+                                      Gender.numeric>0.5 & Gender.numeric_true=='Female' ~ 0,
+                                      Gender.numeric<0.5 & Gender.numeric_true=='Male' ~ 0,
+                                      Gender.numeric==0.5 ~ 0))
+  real.data.perc= df %>% dplyr::summarize(perc.cor=mean(correct))
+  
+  perms.perc =foreach(ip = 1:nperm,.combine='c',.packages=c('dplyr','tidyr')) %dopar%{
+    df.perm= data.frame(Gender.numeric=df$Gender.numeric, Gender.numeric_true=sample(df$Gender.numeric_true)) %>%
+      dplyr::mutate(correct = case_when(Gender.numeric>0.5 & Gender.numeric_true=='Male' ~ 1,
+                                                            Gender.numeric<0.5 & Gender.numeric_true=='Female' ~ 1,
+                                                            Gender.numeric>0.5 & Gender.numeric_true=='Female' ~ 0,
+                                                            Gender.numeric<0.5 & Gender.numeric_true=='Male' ~ 0)) %>%
+      dplyr::summarize(perc.cor=mean(correct,na.rm=T))
+    return(df.perm$perc.cor)
+  }
+  
+  f.accuracy=ecdf(perms.perc)
+  real.data.stats= 1-f.accuracy(real.data.perc)
+  out=list(accuracy=real.data.perc,
+           p=real.data.stats)
+  return(out)
+}
+
+
+func.splitDataTypes = function(df.task,df.psych,df.taskFactors,task.loadingsCategories){
+  #df.task: task measures; df.psych: factors/questionnaire subscales, education, gender,age
+  df= left_join(df.task, df.psych,by='ID') %>% #-Age, -EducationLevel
+  dplyr::select(-starts_with('CaughtSplitControlAnalysis'),
+                -starts_with('compM_PostDisc_Post.ForageCheckHide'),
+                -contains('StressOnly'),-contains('ExciteOnly'),-contains('ExcOrthPre'),-contains('StressOrthPre'),
+                -contains('fitted.ok.flag')) %>% dplyr::ungroup()
+  
+  # input: already combined psych and task/debrief measures we want to use
+  data.split=list()
+  data.split$debrief             = df %>% dplyr::select(starts_with('DEBR'),any_of(colnames(df.psych))) %>% dplyr::select(-ID)
+  data.split$mood_related        = df %>% dplyr::select(starts_with('mb'),
+                                                                   starts_with('bm'),
+                                                                   starts_with('Exc'),
+                                                                   starts_with('Stress'),
+                                                                   any_of(colnames(df.psych))) %>% dplyr::select(-ID)
+  data.split$compoundTask_noMood = df %>% dplyr::select(-starts_with('mb'),
+                                                                   -starts_with('bm'),
+                                                                   -starts_with('Exc'),
+                                                                   -starts_with('Stress'),
+                                                                   -starts_with('DEBR'),
+                                                                   -starts_with('compM'),
+                                                                   any_of(colnames(df.psych))) %>% dplyr::select(-ID)
+  data.split$indivChoiceModel    = df %>% dplyr::select(starts_with('compM'), any_of(colnames(df.psych))) %>% dplyr::select(-ID)
+  data.split$allTask             = df %>% dplyr::select(-starts_with('DEBR'), any_of(colnames(df.psych))) %>% dplyr::select(-ID)
+  data.split$allTask_debrief     = df  %>% dplyr::select(-ID)
+  data.split$compoundTask_indivChoiceModel_noMood=df %>% dplyr::select(-starts_with('mb'),
+                                                                                  -starts_with('bm'),
+                                                                                  -starts_with('Exc'),
+                                                                                  -starts_with('Stress'),
+                                                                                  -starts_with('DEBR'),
+                                                                                  any_of(colnames(df.psych))) %>% dplyr::select(-ID)
+  data.split$allTask_rewardInteractionsOnly = df %>% dplyr::select(contains('_rewAvail.currTP'),contains('_reward.start'),any_of(colnames(df.psych)),-ID)
+  
+  # add for the task
+  df = left_join(df.taskFactors %>% dplyr::select(ID,starts_with('GLS')),df.psych,by='ID')%>% dplyr::ungroup()
+  
+  for (itask in colnames(task.loadingsCategories%>% dplyr::select(-factor))){
+    gls = task.loadingsCategories %>% dplyr::filter(!is.na(!! rlang::sym(itask))) %>% pull(factor)
+    data.split[[paste0('TaskFactor_',itask)]] = df %>% dplyr::select(all_of(colnames(df.psych)),all_of(gls))%>% dplyr::select(-ID)
+  }
+  data.split$ID=df$ID
+
+  return(data.split)
+}
+
+
+
+
+func.pic.corrTTest = function(df.notRenamed,this.test.type){
+  
+  df=df.notRenamed%>%
+  dplyr::rename(Education=Education.numeric,`Compul. checking`=oci,`Apathy (behav)`=apathyMotivationIndex_Behavioural, `Apathy (emot)`= apathyMotivationIndex_Emotional, Anhedonia= shaps,`Intol uncert (prosp)`=intolUncert_ProspectAnx,`Intol uncert (inhib)`=intolUncert_InhibAnx,`Anx (cognit)`=sticsa.trait.cognitive,`Anx (somatic)`=sticsa.trait.somatic,Decentering=decentering,Gender=Gender.numeric)
+
+corr     =cor(df %>% dplyr::select_if(is.numeric),'use'='pairwise.complete.obs',method=this.test.type)
+p.mat    =ggcorrplot::cor_pmat(df%>% dplyr::select_if(is.numeric),'use'='pairwise.complete.obs',method=this.test.type)
+corr.adj = data.frame(matrix(ncol=0,nrow=1))
+rownames(corr.adj)='Gender'
+p.adj = data.frame(matrix(ncol=0,nrow=1))
+rownames(p.adj)='Gender'
+
+for (ic in colnames(df.notRenamed)){
+  if (!ic %in%  c('Gender.numeric','Gender.original')){
+  t=df.notRenamed %>%  ungroup() %>% dplyr::filter(Gender.original %in% c('Male','Female')) %>% 
+    rstatix::cohens_d(as.formula(paste(ic,'~Gender.original')),paired=F)
+  cohensd = t$effsize
+  t=df.notRenamed %>%  ungroup() %>% dplyr::filter(Gender.original %in% c('Male','Female')) %>% 
+    rstatix::t_test(as.formula(paste(ic,'~Gender.original')),paired=F)
+  p.ttest=  t$p
+  corr.adj[[ic]]= cohensd
+  p.adj[[ic]] = p.ttest
+  } else if (ic =='Gender.numeric'){
+    corr.adj[[ic]]=1
+    p.adj[[ic]] = 0
+  }
+}
+corr.adj = corr.adj %>% 
+  dplyr::rename(Education=Education.numeric,`Compul. checking`=oci,`Apathy (behav)`=apathyMotivationIndex_Behavioural, `Apathy (emot)`= apathyMotivationIndex_Emotional, Anhedonia= shaps,`Intol uncert (prosp)`=intolUncert_ProspectAnx,`Intol uncert (inhib)`=intolUncert_InhibAnx,`Anx (cognit)`=sticsa.trait.cognitive,`Anx (somatic)`=sticsa.trait.somatic,Decentering=decentering,Gender=Gender.numeric) %>%  dplyr::relocate(colnames(corr))
+p.adj = p.adj %>% dplyr::rename(Education=Education.numeric,`Compul. checking`=oci,`Apathy (behav)`=apathyMotivationIndex_Behavioural, `Apathy (emot)`= apathyMotivationIndex_Emotional, Anhedonia= shaps,`Intol uncert (prosp)`=intolUncert_ProspectAnx,`Intol uncert (inhib)`=intolUncert_InhibAnx,`Anx (cognit)`=sticsa.trait.cognitive,`Anx (somatic)`=sticsa.trait.somatic,Decentering=decentering,Gender=Gender.numeric) %>%  dplyr::relocate(colnames(corr))
+
+corr[which(rownames(corr)=='Gender'),]   = as.matrix(corr.adj[1,])
+corr[,which(rownames(corr)=='Gender')]   = as.matrix(corr.adj[1,])
+p.mat[which(rownames(p.mat)=='Gender'),] = as.matrix(p.adj[1,])
+p.mat[,which(rownames(p.mat)=='Gender')] = as.matrix(p.adj[1,])
+
+plot.corr=ggcorrplot(corr,p.mat=p.mat,lab=TRUE)+ #insig="blank")+
+  theme(axis.text.x=element_text(size=14),axis.text.y=element_text(size=12))+ggtitle(" ")
+
+return(plot.corr)
+}
+
+
+```
+
+
+# Factor analyses - questionnaires
+It turns out that factor score extraction is not trivial and several methods exist: DiStefano, Christine, Min Zhu, and Diana Mindrila. "Understanding and using factor scores: Considerations for the applied researcher." Practical assessment, research, and evaluation 14.1 (2019): 20. The psych default is by regression.
+See also Grice (2001) "Computing and evaluating factor scores" for a discussion of factor indeterminacy.
+
+
+## Factor analysis
+As in Trier et al. (2025), perform factor analysis (with cut off for loadings: unique loading >0.4) on replication sample. First we impute for missing data 
+```{r}
+data.types = c('disc','repl')
+
+# Impute data 
+for (idata in data.types){
+  # Get the data, find participants with too many missing answers a
+  ques.raw.this=switch(idata,'disc'=ques.raw.disc,'repl'=ques.raw.repl)
+  excl.sub=ques.raw.this %>% dplyr::select(ID,contains('perc.missing')) %>% rowwise() %>% 
+    dplyr::mutate(max.missing=max(c_across(-ID))) %>% dplyr::filter(max.missing>10) %>% pull(ID)
+  
+  ques.raw.this = ques.raw.this %>% 
+    dplyr::filter(!ID %in% excl.sub) %>%
+    dplyr::select(contains('.Q'),contains('.EQ'),ID) %>% dplyr::select(-starts_with('Durations.all.')) %>% dplyr::select(-starts_with('DEBRIEF')) %>%
+    dplyr::select(-starts_with('STICSA.state'))
+  # there are  some column names that were added, but not measured for anyone
+  t=ques.raw.this %>% dplyr::summarize_all(~sum(is.na(.))) %>% pivot_longer(everything()) %>% dplyr::filter(value>50)
+  ques.raw.this=ques.raw.this %>% dplyr::select(-all_of(t$name)) %>% dplyr::ungroup() 
+  
+  # Impute the data
+  questionnaires.imputed.file=file.path(paths$imputedData,paste0('questionnaire_imputed_',idata,'.RData'))
+  if(!file.exists(questionnaires.imputed.file)){
+    ques.raw.this=ques.raw.this%>% dplyr::mutate_at(vars(-ID),~c(scale(.)))
+    which(is.na(ques.raw.this),arr.ind=T)
+    imputed.cov = mifa(data=ques.raw.this %>% dplyr::select(-ID),print=FALSE,method='cart',n_boot=100)
+    save(imputed.cov,file=file.path(paths$imputedData,paste0('cov_mat_questionnaires_imputed_',idata,'.RData'))) 
+    questionnaires.imputed=complete(futuremice(ques.raw.this, method = "cart",m=6,n.core=6))
+    save(questionnaires.imputed,file=questionnaires.imputed.file)
+  }
+  
+}
+ 
+
+# Run factor analysis on the replication sample
+load(file.path(paths$imputedData,paste0('cov_mat_questionnaires_imputed_repl.RData')))  # imputed.cov
+load(file.path(paths$imputedData,paste0('questionnaire_imputed_',idata,'.RData')))      # questionnaires.imputed
+
+imputed.cov.reduced= imputed.cov$cov_combined
+glorfeld.fa= paran::paran(mat=cov2cor(imputed.cov.reduced),n=nrow(questionnaires.imputed),iterations=5000,centile=99)
+factor.analysis.removedItems.this =psych::fa(imputed.cov.reduced,nfactors=glorfeld.fa$Retained,n.obs=nrow(questionnaires.imputed),fm='gls')
+factor.analysis.this=factor.analysis.removedItems.this
+removing.items.done=FALSE
+while(removing.items.done==FALSE){
+  loadings= data.frame(unclass(factor.analysis.removedItems.this$loadings)) %>% tibble::rownames_to_column() %>%
+    pivot_longer(-rowname,names_to='reg',values_to='loading')%>%dplyr::group_by(rowname) %>% 
+    dplyr::mutate(max=max(abs(loading)),
+                  num.greater04 = sum(abs(loading)>0.4),
+                  num.greater03 = sum(abs(loading)>0.3)) %>%
+    pivot_wider(names_from='reg',values_from=c('loading')) #
+  loadings.high= loadings%>%
+    dplyr::filter(max>0.4 & num.greater03==1) # remove variables that have no loading above 0.4 and those that have higher than 0.4 cross loadings
+  
+  if (nrow(loadings) > nrow(loadings.high)){
+    cov.mat.reduced = imputed.cov$cov_combined[colnames(imputed.cov$cov_combined) %in% loadings.high$rowname,
+                                               colnames(imputed.cov$cov_combined) %in% loadings.high$rowname]
+    glorfeld.fa= paran::paran(mat=cov2cor(cov.mat.reduced),n=nrow(questionnaires.imputed),iterations=5000,centile=99)
+    factor.analysis.removedItems.this =psych::fa(cov.mat.reduced,nfactors=glorfeld.fa$Retained,n.obs=nrow(questionnaires.imputed),fm='gls')
+  } else{
+    removing.items.done=TRUE
+  }
+  
+}
+
+save(factor.analysis.removedItems.this, file=file.path(paths$imputedData,paste0('FA_removedItems_Questionnaires_repl.RData')))
+save(factor.analysis.this, file=file.path(paths$imputedData,paste0('FA_allItems_Questionnaires_repl.RData')))
+rm(imputed.cov,questionnaires.imputed,factor.analysis.removedItems.this,factor.analysis.this,glorfeld.fa)
+
+  
+
+# also print summary files with the output of the factor analysis and plot the factor loadings
+load(file.path(paths$imputedData,paste0('FA_removedItems_Questionnaires_repl.RData'))) #factor.analysis.removedItems.this
+# Print factor loadings
+names.to.use=data.frame(GLS=c('GLS1','GLS2','GLS3','GLS4','GLS5','GLS6','GLS7'),
+                        name=c('Anxiety','Anhedonia','IntolUncert','Decentering','Apathy (behav)','Apathy (emot)','Compul. check'))
+plots.fa=func.plotFA(factor.analysis.removedItems.this,paste('Repl - Reduced items'),names.to.use = names.to.use)
+ggexport(plots.fa,filename=file.path(paths$results,paste0('FactorAnalysis_AllQuestionnaires_removedItemsLowLoading_repl.jpg')),
+         width=9*400,height=7.7*400,res=400)
+
+# Print correlation matrix for factors
+factor.cors=as.data.frame(factor.analysis.removedItems.this$Phi) %>% tibble::rownames_to_column() %>%
+  left_join(.,names.to.use,by=c('rowname'='GLS')) %>% dplyr::select(-rowname) %>% dplyr::rename(factors=name) 
+orig.names=names(factor.cors)
+names(orig.names)=c(names.to.use$name,'Factors')
+factor.cors=rename(factor.cors,all_of(orig.names)) %>% tibble::column_to_rownames(.,var='Factors')
+plots.corr=ggcorrplot::ggcorrplot(factor.cors,lab=TRUE,show.legend = TRUE)+
+  theme(axis.text.x=element_text(size=14),axis.text.y=element_text(size=12))+ggtitle(" ")
+ggexport(plots.corr,filename=file.path(paths$results,paste0('FactorAnalysis_AllQuestionnaires_removedItemsLowLoading_repl_factor_correlations.jpg')), width=12*400,height=7.7*400,res=400)
+```
+
+## Factor extraction
+Loading the factor analysis run on the replication data, applied to the discovery data.
+
+```{r}
+
+extract.methods = c('Thurstone','tenBerge','Anderson','Bartlett','Harman','nonweighted.sum') #'components' default: to check what the default is
+
+
+load(file.path(paths$imputedData,paste0('FA_removedItems_Questionnaires_repl.RData'))) #factor.analysis.removedItems.this
+
+for (idata in data.types){
+  all.factorScores=list()
+  load(file.path(file.path(paths$imputedData,paste0('questionnaire_imputed_',idata,'.RData'))))   #questionnaires.imputed
+  for (imethod in extract.methods){
+    factor.names=c('GLS3'='IntolUncert',
+                   'GLS2'='Anhedonia',
+                   'GLS1'='Anxiety',
+                   'GLS4'='Decentering',
+                   'GLS5'='Apathy.behav',
+                   'GLS6'='Apathy.emot',
+                   'GLS7'='Compul.checking')
+    
+    factor.names=setNames(names(factor.names),factor.names)
+    item.names=rownames(as.data.frame(unclass(factor.analysis.removedItems.this$loadings)))
+    if (imethod =='nonweighted.sum'){
+      loadings=data.frame(unclass(factor.analysis.removedItems.this$loadings)) %>%  tibble::rownames_to_column()
+      questionnaires.factorScores=data.frame(ID=questionnaires.imputed$ID)
+      for (ifac in colnames(loadings %>% ungroup() %>% dplyr::select(starts_with('GLS')))){
+        this.items.pos= loadings %>% dplyr::filter(!!sym(ifac)>0.4) %>% pull(rowname)
+        this.items.neg= loadings %>% dplyr::filter(!!sym(ifac)<(-0.4)) %>% pull(rowname)
+        t= questionnaires.imputed %>% dplyr::select(all_of(this.items.pos),all_of(this.items.neg)) %>% rowwise() %>% 
+          dplyr::mutate(factorScores.pos = sum(c_across(all_of(this.items.pos))),
+                        factorScores.neg = sum(c_across(all_of(this.items.neg))),
+                        !!sym(ifac):= factorScores.pos-factorScores.neg)
+        questionnaires.factorScores[[ifac]]  = t[[ifac]]
+      }
+      questionnaires.factorScores=questionnaires.factorScores %>% dplyr::rename(all_of(factor.names))
+    } else if (imethod=='default'){
+      t2=factor.scores(questionnaires.imputed %>% dplyr::select(all_of(item.names)),factor.analysis.removedItems.this) # don't specify method
+      questionnaires.factorScores=data.frame(unclass(t2$scores)) %>% dplyr::rename(all_of(factor.names)) %>% dplyr::mutate(ID = questionnaires.imputed$ID)
+    }else{
+      t2=factor.scores(questionnaires.imputed %>% dplyr::select(all_of(item.names)),factor.analysis.removedItems.this,
+                       method=imethod)
+      questionnaires.factorScores=data.frame(unclass(t2$scores)) %>% dplyr::rename(all_of(factor.names)) %>% dplyr::mutate(ID = questionnaires.imputed$ID)
+    }
+    all.factorScores[[imethod]]= questionnaires.factorScores
+  }
+  save(all.factorScores,file=file.path(paths$imputedData,paste0('FactorScores__data_',idata,'__FA_repl__allMethods.RData'))) #
+}
+
+```
+
+## Plot the factor score correlations
+
+We can now plot the results
+Plots:
+- correlations between the factor scores in the discovery and replication sample with different extraction methods
+- in the discovery sample, correlations of the factor scores for selected factors across the different methods
+
+
+```{r}
+all.factorScores.master=list()
+for (idata.to.extract in data.types){
+  #for (ifa.to.apply in data.types){
+    load(file.path(paths$imputedData,paste0('FactorScores__data_',idata.to.extract,'__FA_repl__allMethods.RData'))) #all.factorScores
+    all.factorScores.master[[paste0('data_',idata.to.extract,'__FA_repl')]]= all.factorScores
+}
+#}
+
+plots.corrmats=list()
+methods=names(all.factorScores.master$data_disc__FA_repl)
+for (imethod in methods){
+  plotsT=list()
+  for (iname in names(all.factorScores.master)){
+    df= all.factorScores.master[[iname]][[imethod]] %>% dplyr::select(-ID) %>%
+      dplyr::relocate(Anxiety,  Anhedonia, IntolUncert, Decentering, Apathy.behav, Apathy.emot, Compul.checking)
+    corr     =cor(df,'use'='pairwise.complete.obs')
+    p.mat    =ggcorrplot::cor_pmat(df,'use'='pairwise.complete.obs')
+    # Make image of correlation matrix (Corrplot also has functions for ordering the correlation matrix or it can be done manually)
+    plotsT[[iname]]=ggcorrplot(corr,p.mat=p.mat,lab=TRUE,show.legend=F)+theme(axis.text.x=element_text(size=8),axis.text.y=element_text(size=10))+ggtitle(iname)
+    
+    rm(corr,p.mat)
+  }
+  plots.corrmats[[imethod]] = ggarrange(plotlist=plotsT,ncol=2,nrow=2)
+  plots.corrmats[[imethod]]= annotate_figure(plots.corrmats[[imethod]], top = text_grob(imethod, color = "red", face = "bold", size = 14))
+  rm(plotsT)  
+}
+ggexport(plotlist=plots.corrmats,filename=file.path(paths$results,paste0('FactorAnalysis_Questionnaires_FactorCorrs_all.pdf')))
+
+
+# Differently arranged for paper: columns = replication, discovery/sample, rows = simple sum, Thurstone, Harman, Bartlett
+plots.corrmats=list()
+methods=c('nonweighted.sum','Thurstone','Bartlett')
+for (imethod in methods){ #},'Harman')){
+  plotsT=list()
+  for (iname in c('data_disc__FA_repl','data_repl__FA_repl')){
+    df= all.factorScores.master[[iname]][[imethod]] %>% dplyr::select(-ID) %>%
+      dplyr::relocate(Anxiety,  Anhedonia, IntolUncert, Decentering, Apathy.behav, Apathy.emot, Compul.checking)
+    corr     =cor(df,'use'='pairwise.complete.obs')
+    p.mat    =ggcorrplot::cor_pmat(df,'use'='pairwise.complete.obs')
+    # Make image of correlation matrix (Corrplot also has functions for ordering the correlation matrix or it can be done manually)
+    plotsT[[iname]]=ggcorrplot(corr,p.mat=p.mat,lab=TRUE,show.legend=F)+theme(axis.text.x=element_text(size=8),axis.text.y=element_text(size=10))+ggtitle(iname)
+    
+    rm(corr,p.mat)
+  }
+  plots.corrmats[[imethod]] = ggarrange(plotlist=plotsT,ncol=2,nrow=1)
+  plots.corrmats[[imethod]]= annotate_figure(plots.corrmats[[imethod]], top = text_grob(imethod, color = "black", face = "bold", size = 14))
+  rm(plotsT)  
+}
+
+p=ggarrange(plotlist=plots.corrmats,nrow=3,ncol=1)
+ggexport(p,filename=file.path(paths$results,paste0('FactorAnalysis_Questionnaires_FactorCorrs_correlationMaps_differentMethods_summaryFig.jpg')), width=10*400,height=12*400,res=400)
+
+
+# Check 2: how similar are the values across the methods
+data.comparison=list()
+factor.names= names(all.factorScores.master[[paste0('data_disc__FA_repl')]][['Thurstone']] %>% dplyr::select(-ID))
+for (idata in data.types){
+  data.comparison[[idata]] = data.frame(ID=all.factorScores.master[[paste0('data_',idata,'__FA_repl')]]$Thurstone$ID)
+  #for (ifa.to.apply in data.types){
+    for (imethod in methods){
+      for (ifac in factor.names){
+        df=all.factorScores.master[[paste0('data_',idata,'__FA_repl')]][[imethod]] %>% dplyr::select(ID,all_of(ifac)) %>%
+          dplyr::rename(!!sym(paste0(ifac,'_',idata,'_repl_',imethod)):=!!sym(ifac))
+        data.comparison[[idata]]=left_join(data.comparison[[idata]],df,by='ID')
+      }
+    #}
+    
+  }
+}
+# How similar are extracted scores for: just discovery sample, trained on replication sample
+plots=list()
+for (ifac in colnames(all.factorScores.master$data_disc__FA_repl$Thurstone %>% dplyr::select(-ID))){
+  for(idata in data.types){
+    
+    if (idata=='disc'){
+      df= data.comparison[[idata]]%>%dplyr::select(contains('disc_repl')) %>% dplyr::select(starts_with(ifac)) 
+    } else{
+      df= data.comparison[[idata]]%>%dplyr::select(contains('repl_repl')) %>% dplyr::select(starts_with(ifac)) 
+    }
+    df=df%>%
+      dplyr::rename_all(~stringr::str_remove(.,ifac)) %>%
+      dplyr::rename_all(~stringr::str_remove_all(.,'_repl_repl_|_disc_repl_'))%>%
+      dplyr::rename(`sum`=nonweighted.sum)
+    corr     =cor(df,'use'='pairwise.complete.obs')
+    p.mat    =ggcorrplot::cor_pmat(df,'use'='pairwise.complete.obs')
+    # Make image of correlation matrix (Corrplot also has functions for ordering the correlation matrix or it can be done manually)
+    plots[[paste0(idata,'_',ifac)]]=ggcorrplot(corr,p.mat=p.mat,lab=TRUE,show.legend=F)+
+      theme(axis.text.x=element_text(size=8),axis.text.y=element_text(size=10))+
+      ggtitle(paste(ifac,'- scores for:', idata))
+  }
+}
+#}
+ggexport(plotlist=plots,filename=file.path(paths$results,paste0('FactorAnalysis_Questionnaires_CorrsAcrossMethods_.pdf')))
+
+# Make a summary plot: most extreme values are for anxiety and behavioural apathy
+p=ggarrange(plots$disc_Apathy.emot,plots$repl_Apathy.emot,
+            plots$disc_Apathy.behav,plots$repl_Apathy.behav,nrow=2,ncol=2)
+ggexport(p, filename=file.path(paths$results,paste0('FactorAnalysis_Questionnaires_CorrsAcrossMethods_Anxiety_ApathyBehav.jpg')), width=7*400,height=7*400,res=400)
+
+```
+
+## Further control analysis: dependence of the factor scores of a person on the questionnaire responses of other participants.
+A good factor extraction method should always produce the same factor scores for a person, no matter who else is in the sample. This would be particularly important when applying the factor analysis to a small clinical sample, rather than to another huge general population sample.
+```{r}
+data.types = c('discovery','replication')
+#file.path.part1= file.path(paths$replication,'Data','Preprocessed','FactorAnalysis','Questionnaires','Troubleshooting')
+extract.methods = c('Thurstone','Bartlett','nonweighted.sum') 
+load(file.path(file.path(paths$imputedData,paste0('questionnaire_imputed_disc.RData'))))   #questionnaires.imputed
+data.discovery.imputed=questionnaires.imputed
+load(file.path(file.path(paths$imputedData,paste0('questionnaire_imputed_repl.RData'))))   #questionnaires.imputed
+data.repl.imputed.temp=questionnaires.imputed
+# change IDs so we don't get confused
+data.repl.imputed.temp = questionnaires.imputed %>% dplyr::mutate(ID=seq(10000,10000+nrow(questionnaires.imputed)-1))
+rm(questionnaires.imputed)
+load(file.path(paths$imputedData,paste0('FA_removedItems_Questionnaires_repl.RData'))) #factor.analysis.removedItems.this
+
+
+for (imethod in extract.methods){
+  this.file=file.path(paths$imputedData,paste0('FactorScores__data_disc__FA_repl__method_',imethod,'__','_DiscoverySampleParticipantsOneByOneInReplicationSample.RData'))
+  all.factorScores.discIncludedReplSample=data.frame()
+  if (!file.exists(this.file)){
+  for (isub in data.discovery.imputed$ID){
+    questionnaires.imputed=bind_rows(data.repl.imputed.temp,
+                                     data.discovery.imputed %>% dplyr::filter(ID==isub))
+    factor.names=c('GLS3'='IntolUncert',
+                   'GLS2'='Anhedonia',
+                   'GLS1'='Anxiety',
+                   'GLS4'='Decentering',
+                   'GLS5'='Apathy.behav',
+                   'GLS6'='Apathy.emot',
+                   'GLS7'='Compul.checking')
+    
+    factor.names=setNames(names(factor.names),factor.names)
+    item.names=rownames(as.data.frame(unclass(factor.analysis.removedItems.this$loadings)))
+    if (imethod =='nonweighted.sum'){
+      loadings=data.frame(unclass(factor.analysis.removedItems.this$loadings)) %>%  tibble::rownames_to_column()
+      questionnaires.factorScores=data.frame(ID=questionnaires.imputed$ID)
+      for (ifac in colnames(loadings %>% ungroup() %>% dplyr::select(starts_with('GLS')))){
+        this.items.pos= loadings %>% dplyr::filter(!!sym(ifac)>0.4) %>% pull(rowname)
+        this.items.neg= loadings %>% dplyr::filter(!!sym(ifac)<(-0.4)) %>% pull(rowname)
+        t= questionnaires.imputed %>% dplyr::select(all_of(this.items.pos),all_of(this.items.neg)) %>% rowwise() %>% 
+          dplyr::mutate(factorScores.pos = sum(c_across(all_of(this.items.pos))),
+                        factorScores.neg = sum(c_across(all_of(this.items.neg))),
+                        !!sym(ifac):= factorScores.pos-factorScores.neg)
+        questionnaires.factorScores[[ifac]]  = t[[ifac]]
+      }
+      questionnaires.factorScores=questionnaires.factorScores %>% dplyr::rename(all_of(factor.names))
+    } else if (imethod=='default'){
+      t2=factor.scores(questionnaires.imputed %>% dplyr::select(all_of(item.names)),factor.analysis.removedItems.this) # don't specify method
+      questionnaires.factorScores=data.frame(unclass(t2$scores)) %>% dplyr::rename(all_of(factor.names)) %>% dplyr::mutate(ID = questionnaires.imputed$ID)
+    }else{
+      t2=factor.scores(questionnaires.imputed %>% dplyr::select(all_of(item.names)),factor.analysis.removedItems.this,
+                       method=imethod)
+      questionnaires.factorScores=data.frame(unclass(t2$scores)) %>% dplyr::rename(all_of(factor.names)) %>% dplyr::mutate(ID = questionnaires.imputed$ID)
+    }
+    all.factorScores.discIncludedReplSample = rbind(all.factorScores.discIncludedReplSample,
+                                                    questionnaires.factorScores %>% dplyr::filter(ID==isub) %>%
+                                                      dplyr::mutate(method=imethod,surroundingSample=idata.to.extract))
+    #all.factorScores[[imethod]]= questionnaires.factorScores
+  }
+  save(all.factorScores.discIncludedReplSample,file=this.file) #
+  }
+}
+
+CONTINUE HERE!!!!!
+# Extract and plot the results
+plots=list()
+load(file.path(paths$imputedData,paste0('FactorScores__data_disc__FA_repl__allMethods_.RData'))) #all.factorScores
+all.factorScores.discovery.inDiscovery=all.factorScores
+for (imethod in extract.methods){
+  this.file=file.path(paths$imputedData,paste0('FactorScores__data_disc__FA_repl__method_',imethod,'___DiscoverySampleParticipantsOneByOneInReplicationSample.RData'))
+  if (file.exists(this.file)){
+    df.discInDisc =all.factorScores.discovery.inDiscovery[[imethod]] #%>% dplyr::select(ID,all_of(ifac))
+    load(this.file) #all.factorScores.discIncludedReplSample
+    df.discInRepl = all.factorScores.discIncludedReplSample %>% dplyr::filter(method==imethod) %>% #dplyr::select(ID,ifac) %>% 
+      dplyr::rename_at(vars(-ID),~paste0(.,'_inRepl'))
+    df.joined=left_join(df.discInDisc,df.discInRepl,by='ID') %>% dplyr::select_if(is.numeric)
+   corr     =cor(df.joined,'use'='pairwise.complete.obs')
+    p.mat    =cor_pmat(df.joined,'use'='pairwise.complete.obs')
+    # Make image of correlation matrix (Corrplot also has functions for ordering the correlation matrix or it can be done manually)
+    plots[[imethod]]=ggcorrplot(corr,p.mat=p.mat,lab=TRUE,show.legend=F)+theme(axis.text.x=element_text(size=8),axis.text.y=element_text(size=10))+ ggtitle(imethod)
+  }
+}
+ggexport(plotlist=plots,filename=file.path(paths$figures,'Revision2_FactorAnalysis_Questionnaires_DiscSampleDiscOrReplSurround.pdf'))
+
+```
+
+
+
+## Make figures for the paper
+[1] Correlation among subscales for the two samples + correlation of factors (repl sample)
+[2] Factor loadings (done above)
+[3] Factor scores across different methods for two example factors 
+[4] Factor score correlations: for discovery and replication sample, when extracted with different methods
+
+```{r}
+plot.extendedData=list()
+plot.extendedData.spearman=list()
+# Subscale correlations/ t-test for gender
+# - Replication sample:
+df.notRenamed=data.replication.psych %>% dplyr::select(-ID,-EducationLevel) %>% dplyr::ungroup() %>%
+  dplyr::mutate(Gender.original=Gender)%>% dplyr::select(-Gender) 
+this.plot=func.pic.corrTTest(df.notRenamed,'pearson')
+corr.pearson=cor(df.notRenamed %>% dplyr::select_if(is.numeric),method='pearson','use'='pairwise.complete.obs')
+corr.spearman=cor(df.notRenamed %>% dplyr::select_if(is.numeric),method='spearman','use'='pairwise.complete.obs')
+max(corr.pearson-corr.spearman)
+min(corr.pearson-corr.spearman)
+plot.extendedData$corrsScales = this.plot
+ggexport(this.plot,filename=file.path(paths$figures,'Revision2_SubscaleCorrelations_GenderCohensD_ReplicationSample.jpg'), width=7.4*400,height=7.7*400,res=400)
+# for publication: checking assumptions - not fulfilled -> replace with non-parametric
+df.notRenamed %>% dplyr::select_if(is.numeric) %>% sapply(.,shapiro.test)
+this.plot=func.pic.corrTTest(df.notRenamed,'spearman')
+plot.extendedData.spearman$corrsScales = this.plot
+
+# - Replication sample, split by age:
+df.notRenamed=data.replication.psych %>% dplyr::select(-ID,-EducationLevel) %>% dplyr::ungroup() %>%
+  dplyr::mutate(Gender.original=Gender)%>% dplyr::select(-Gender) %>% dplyr::filter(Age<=40)
+this.plot.notAbove40=func.pic.corrTTest(df.notRenamed,'pearson')
+df.notRenamed=data.replication.psych %>% dplyr::select(-ID,-EducationLevel) %>% dplyr::ungroup() %>%
+  dplyr::mutate(Gender.original=Gender)%>% dplyr::select(-Gender) %>% dplyr::filter(Age>40)
+this.plot.above40=func.pic.corrTTest(df.notRenamed,'pearson')
+this.plot=ggarrange(this.plot.notAbove40,this.plot.above40,labels=c('Age <=40','Age>40'),nrow=1,ncol=2)
+ggexport(this.plot,filename=file.path(paths$figures,'Revision2_SubscaleCorrelations_GenderCohensD_ReplicationSample_splitByAge.jpg'), width=15*400,height=7.7*400,res=400)
+
+# - Discovery sample:
+df.notRenamed=data.discovery.psych %>% dplyr::select(-ID,-EducationLevel) %>% dplyr::ungroup() %>%
+  dplyr::mutate(Gender.original=Gender)%>% dplyr::select(-Gender) 
+this.plot=func.pic.corrTTest(df.notRenamed,'pearson')
+ggexport(this.plot,filename=file.path(paths$figures,'Revision2_SubscaleCorrelations_GenderCohensD_DiscoverySample.jpg'), width=7.4*400,height=7.7*400,res=400)
+
+
+# Correlations of factor scores
+ifa.to.apply='Replication'
+file.path.part1=file.path(paths$replication,'Data','Preprocessed','FactorAnalysis','Questionnaires','Troubleshooting')
+load(file.path(file.path.part1,paste0('FactorScores__data_','Replication','__FA_',ifa.to.apply,'__allMethods_zscored.RData'))) #all.factorScores
+replication.factors=all.factorScores$Bartlett %>% dplyr::select(-ID)
+rm(all.factorScores)
+load(file=file.path(file.path.part1,paste0('questionnaire_imputed_','Replication','_zscored.RData'))) #questionnaires.imputed
+load(file.path(file.path.part1,paste0('FactorScores__data_','Discovery','__FA_',ifa.to.apply,'__allMethods_zscored.RData'))) #all.factorScores
+discovery.factors=all.factorScores$Bartlett%>% dplyr::select(-ID)
+
+corr     =cor(replication.factors,'use'='pairwise.complete.obs',method='pearson')
+corr.pearson=corr
+p.mat    = ggcorrplot::cor_pmat(replication.factors,'use'='pairwise.complete.obs',method='pearson')
+# Make image of correlation matrix (Corrplot also has functions for ordering the correlation matrix or it can be done manually)
+plot.corr.replication=ggcorrplot(corr,p.mat=p.mat,lab=TRUE)+ #insig="blank")+
+  theme(axis.text.x=element_text(size=14),axis.text.y=element_text(size=12))+ggtitle(" ")
+plot.extendedData$corrsFactors = plot.corr.replication
+rm(corr,p.mat)
+# Same spearman
+corr     =cor(replication.factors,'use'='pairwise.complete.obs',method='spearman')
+corr.spearman=corr
+p.mat    = ggcorrplot::cor_pmat(replication.factors,'use'='pairwise.complete.obs',method='spearman')
+# Make image of correlation matrix (Corrplot also has functions for ordering the correlation matrix or it can be done manually)
+plot.corr.replication=ggcorrplot(corr,p.mat=p.mat,lab=TRUE)+ #insig="blank")+
+  theme(axis.text.x=element_text(size=14),axis.text.y=element_text(size=12))+ggtitle(" ")
+plot.extendedData.spearman$corrsFactors = plot.corr.replication
+rm(corr,p.mat)
+corr.spearman-corr.pearson
+
+corr     =cor(discovery.factors,'use'='pairwise.complete.obs')
+p.mat    =ggcorrplot::cor_pmat(discovery.factors,'use'='pairwise.complete.obs')
+# Make image of correlation matrix (Corrplot also has functions for ordering the correlation matrix or it can be done manually)
+plot.corr.discovery=ggcorrplot(corr,p.mat=p.mat,lab=TRUE)+ #insig="blank")+
+  theme(axis.text.x=element_text(size=14),axis.text.y=element_text(size=12))+ggtitle(" ")
+rm(corr,p.mat)
+plot.corr=ggarrange(plot.corr.replication,plot.corr.discovery,labels=c('Replication','Discovery'),nrow=1,ncol=2)
+
+ggexport(plot.corr,filename=file.path(paths$figures,'Replication2_FactorCorrelations.png'), width=12*400,height=7.7*400,res=400)
+
+
+# New figure for 'extended data figure: correlations among subscales and correlations among factor scores
+# plot.ext1= ggarrange(plot.extendedData$corrsFactors+
+#                        theme(axis.text.x=element_text(size=16),axis.text.y=element_text(size=14), 
+#                              plot.margin = margin(0, 0, 0, 0, "cm"),axis.title.y=element_blank())+
+#                        labs(title = NULL)+rremove('ylab'),NULL,nrow=2,ncol=1,heights=c(1,1))
+plot.ext = ggarrange(plot.extendedData$corrsScales+
+                       theme(axis.text.x=element_text(size=16),axis.text.y=element_text(size=14), 
+                             plot.margin = margin(0, 0, 0, 0, "cm")),
+                     plot.extendedData$corrsFactors+
+                       theme(axis.text.x=element_text(size=16),axis.text.y=element_text(size=14), 
+                             plot.margin = margin(0, 0, 4, 0, "cm"),axis.title.y=element_blank())+
+                       labs(title = NULL)+rremove('ylab'),
+                     nrow=1,ncol=2,widths=c(1,0.6),labels=c('A Questionnaire subscales','B Factor scores'),hjust=-0.2)
+# plot.ext2= ggarrange(plot.extendedData$corrsScales+
+#                        theme(axis.text.x=element_text(size=16),axis.text.y=element_text(size=14), 
+#                              plot.margin = margin(0, 0, 0, 0, "cm")),
+#                      plot.ext1,
+#                      nrow=1,ncol=2,widths=c(1,0.6))
+
+ggexport(plot.ext,filename=file.path(paths$figures,'Paper_ExtendedFigure2.tiff'), 
+         width=13*800,height=6*800,res=800)
+ggexport(plot.ext,filename=file.path(paths$figures,'Paper_ExtendedFigure2.pdf'),width=13,height=6)
+
+
+# Factor loadings
+load(file=file.path(file.path.part1,paste0('FA_removedItems_Questionnaires_Replication_zscored.RData'))) #factor.analysis.removedItems.this
+keys=data.frame(GLS=c('GLS1','GLS2','GLS3','GLS4','GLS5','GLS6','GLS7'),
+                name=c('Anxiety','Anhedonia','IntolUncert','Decentering','Apathy.behav','Apathy.emot','Compul.checking'))
+plots.fa=func.plotFA(factor.analysis.removedItems.this,'Factor loadings','names.to.use'=keys)
+
+ggexport(plots.fa,filename=file.path(paths$figures,paste0('Paper_ExtendedFigure3.pdf')),width=10,height=10)
+
+```
+
+
+
+# Machine learning with raw task measures and task factors
+## Preprocess data (impute and split)
+- Pre-screen and impute the measures (for replication and discovery sample)
+- For each questionnaire factor
+- For each factor analysis approach
+- For each approach of including other questionnaire factors in the original fit or not
+- For each type of task measure
+
+Impute the task measures and split the data
+```{r}
+do.zscore='zscored' #'zscored' #notZscored
+corrCutOff=1 # in fact, we will not remove here, because a regularized regression can deal with it
+missingCutOff=0.2 # what percentage of participants can have a value missing
+data.replication.reduced = data.replication %>%
+  dplyr::select(-starts_with('compM_PostDisc_Post.ForageCheckHide'),
+                -contains('StressOnly'),-contains('ExciteOnly'),-contains('ExcOrthPre'),-contains('StressOrthPre'), # we're already taking a pre-selection so we only have moods that are corrected for the other mood
+                -contains('fitted.ok.flag'),
+                -contains('rewardSum')) %>% dplyr::ungroup()
+
+# Print table: t-test/ wilcoxon results for within-subject effects
+if (!file.exists(file.path(paths$stats,'Revision2_AllWithinSubjectStats.wilcox.csv'))){
+print.signif.wilcox.repl=data.replication %>% dplyr::select(-contains('fitted.ok.flag'),-ID) %>% ungroup() %>% 
+  dplyr::mutate(H2B.fromCombRegStressExc = (-mb_postDiscovery.checks.any_StressContrExcitePre_AcrossSubjects) +
+                                   mb_hiding.secPredatorUntilPredArrival_StressContrExcitePre_AcrossSubjects +
+                                  (-mb_postDiscovery.forage.seqLength.max_StressContrExcitePre_AcrossSubjects),
+                H2B.fromCmbReg.testExc_notCtrStress= (-mb_postDiscovery.checks.any_ExciteOnlyPre_AcrossSubjects) +
+                                   mb_hiding.secPredatorUntilPredArrival_ExciteOnlyPre_AcrossSubjects +
+                                  (-mb_postDiscovery.forage.seqLength.max_ExciteOnlyPre_AcrossSubjects),
+                H2B.fromCmbReg.testExc_ctrStress= (-mb_postDiscovery.checks.any_ExciteContrStressPre_AcrossSubjects) +
+                                   mb_hiding.secPredatorUntilPredArrival_ExciteContrStressPre_AcrossSubjects +
+                                  (-mb_postDiscovery.forage.seqLength.max_ExciteContrStressPre_AcrossSubjects)) %>% # for reviewer question of doing analysis not with StressOnly regressors
+  pivot_longer(everything()) %>%group_by(name)  %>%
+  rstatix::wilcox_test(value ~ 1,mu=0,detailed=TRUE,p.adjust.method='none') %>% dplyr::rename(p.replication=p,estimate.replication=estimate)
+print.signif.wilcox.disc=data.discovery %>% dplyr::select(-contains('fitted.ok.flag'),-ID) %>% ungroup() %>%
+  dplyr::mutate(H2B.fromCombRegStressExc = (-mb_postDiscovery.checks.any_StressContrExcitePre_AcrossSubjects) +
+                                   mb_hiding.secPredatorUntilPredArrival_StressContrExcitePre_AcrossSubjects +
+                                  (-mb_postDiscovery.forage.seqLength.max_StressContrExcitePre_AcrossSubjects),
+                H2B.fromCmbReg.testExc_notCtrStress= (-mb_postDiscovery.checks.any_ExciteOnlyPre_AcrossSubjects) +
+                                   mb_hiding.secPredatorUntilPredArrival_ExciteOnlyPre_AcrossSubjects +
+                                  (-mb_postDiscovery.forage.seqLength.max_ExciteOnlyPre_AcrossSubjects),
+                H2B.fromCmbReg.testExc_ctrStress= (-mb_postDiscovery.checks.any_ExciteContrStressPre_AcrossSubjects) +
+                                   mb_hiding.secPredatorUntilPredArrival_ExciteContrStressPre_AcrossSubjects +
+                                  (-mb_postDiscovery.forage.seqLength.max_ExciteContrStressPre_AcrossSubjects))%>% 
+                  pivot_longer(everything()) %>%group_by(name)  %>%
+  rstatix::wilcox_test(value ~ 1,mu=0,detailed=TRUE,p.adjust.method='none') %>% dplyr::rename(p.discovery=p,estimate.discovery=estimate)
+print.signif.wilcox.comb = left_join(print.signif.wilcox.repl,print.signif.wilcox.disc %>% dplyr::select(name,p.discovery,estimate.discovery),by='name') %>%
+  dplyr::mutate(p.signif.repl = case_when((sign(estimate.replication) == sign(estimate.discovery)) & (p.discovery<0.05 & p.replication<0.1) ~ T,
+                                          T ~ F))
+
+print.signif.ttest.repl=data.replication %>% dplyr::select(-contains('fitted.ok.flag'),-ID) %>% ungroup() %>% pivot_longer(everything()) %>%group_by(name)  %>%
+  rstatix::t_test(value ~ 1,mu=0,detailed=TRUE,p.adjust.method='none')%>%dplyr::rename(p.replication=p,estimate.replication=estimate)
+print.signif.ttest.disc=data.discovery %>% dplyr::select(-contains('fitted.ok.flag'),-ID) %>% ungroup() %>% pivot_longer(everything()) %>%group_by(name)  %>%
+  rstatix::t_test(value ~ 1,mu=0,detailed=TRUE,p.adjust.method='none')%>%dplyr::rename(p.discovery=p,estimate.discovery=estimate)
+print.signif.ttest.comb = left_join(print.signif.ttest.repl,print.signif.ttest.disc %>% dplyr::select(name,p.discovery,estimate.discovery),by='name') %>%
+  dplyr::mutate(p.signif.repl = case_when((sign(estimate.replication) == sign(estimate.discovery)) & (p.discovery<0.05 & p.replication<0.1) ~ T,
+                                          T ~ F))
+write.csv(print.signif.wilcox.comb,file=file.path(paths$stats,'Revision2_AllWithinSubjectStats.wilcox.csv'))
+write.csv(print.signif.ttest.comb,file=file.path(paths$stats,'Revision2_AllWithinSubjectStats.ttest.csv'))
+rm(list=ls(pattern="print.signif"))
+}
+# select
+# identify on group level significant regressors 
+signif =data.replication.reduced %>% dplyr::summarise_all(~t.test(.)$p.value) %>% pivot_longer(everything(),names_to='reg',values_to='p.value') %>%dplyr::filter(p.value<0.05)
+signif.wilcox = data.frame(p.value=sapply(data.replication.reduced,function(x){wilcox.test(x, mu=0)$p.value})) %>%  tibble::rownames_to_column() %>% 
+  dplyr::filter(p.value<0.05)
+signif.combined=unique(c(signif$reg,signif.wilcox$rowname))
+
+# remove missing amount above cutoff
+perc.lowMissing= data.replication.reduced%>%dplyr::summarize_all(~mean(is.na(.))) %>%pivot_longer(everything(),names_to='regressor',values_to='percMissing') %>% dplyr::filter(percMissing<missingCutOff)
+
+# combine criteria
+criterion = intersect(signif.combined, perc.lowMissing$regressor)
+# remove correlations above cut off
+data.replication.moreReduced=data.frame(ID=data.replication.reduced$ID)
+for (iname in criterion){
+  #print(iname)
+  df.outT=left_join(data.replication.moreReduced,data.replication.reduced%>%dplyr::select(ID,any_of(iname)),by='ID')
+  t=cor(df.outT,use='pairwise.complete.obs')
+  inds=which(t<0.99999 & abs(t) >corrCutOff,arr.ind=TRUE)
+  if (length(inds)==0){ # only add the variable if the correlation is not bad
+    data.replication.moreReduced = left_join(data.replication.moreReduced,data.replication.reduced%>%dplyr::select(ID,any_of(iname)),by='ID')
+  }
+}
+
+
+# impute
+this.file=file.path(paths$replication,'Data','Preprocessed','MachineLearning','ImputedData','Replication_imputed.RData')
+if (!file.exists(this.file)){
+  data.replication.imputed=complete(futuremice(data.replication.moreReduced, method = "cart",m=6,n.core=18))
+  save(data.replication.imputed,file=this.file)
+} else{
+  load(this.file)
+}
+
+# discovery sample: take the same measures
+data.discovery.moreReduced=data.discovery %>% dplyr::select(all_of(colnames(data.replication.moreReduced)))
+this.file=file.path(paths$replication,'Data','Preprocessed','MachineLearning','ImputedData','Discovery_imputed.RData')
+if (!file.exists(this.file)){
+  data.discovery.imputed=complete(futuremice(data.discovery.moreReduced, method = "cart",m=6,n.core=6))
+  save(data.discovery.imputed,file=this.file)
+} else{
+  load(this.file)
+}
+
+# pre-split the data
+fa.methods= c('tenBerge','Bartlett','Harman','Thurstone')
+df.replication.imputed.split = list()
+df.discovery.imputed.split = list()
+# for this, add the factor scores
+load(file.path(paths$replication,'Data','Preprocessed','FactorAnalysis','Questionnaires','Troubleshooting',
+               paste0('FactorScores__data_replication__FA_replication__allMethods_',do.zscore,'.RData'))) 
+all.factorScores.replication=all.factorScores
+load(file.path(paths$replication,'Data','Preprocessed','FactorAnalysis','Questionnaires','Troubleshooting',
+               paste0('FactorScores__data_discovery__FA_replication__allMethods_',do.zscore,'.RData')))
+all.factorScores.discovery=all.factorScores
+
+# Also add task factors (we'll strip the clinical from this as have computed it in a better way now):
+load(file.path(paths$replication,'Data','Preprocessed','FactorAnalysis','Task',paste0('combined_task_psych_factors_replication_cor0.9.RData'))) #taskFactors.psychFactors.replication
+load(file.path(paths$replication,'Data','Preprocessed','FactorAnalysis','Task',paste0('combined_task_psych_factors_discovery_cor0.9.RData'))) #taskFactors.psychFactors.discovery
+loadings.filtered=read.csv(file=file.path(paths$stats,paste0('Revision2_FactorAnalysis_loadingsFilteredAt04_cor0.9.csv')))
+loadings.summary= loadings.filtered %>% dplyr::group_by(factor) %>% dplyr::reframe(types=unique(behav.type)) %>%
+  dplyr::mutate(value=1) %>% pivot_wider(.,names_from ='types',values_from='value')  %>% 
+  dplyr::mutate(Everything=1,
+                Mood = case_when(!is.na(Debrief) ~ NA, # removes GLS6 which is debrief and mood
+                                 T ~ Mood),
+                Task.Comp = case_when(!is.na(Task) | !is.na(compM) ~ 1,
+                                      T ~ NA))  %>% dplyr::select(-Task,-compM)
+
+
+
+for (ifa in fa.methods){
+  # replication
+  df.task = data.replication.imputed %>% dplyr::mutate_at(vars(-ID),~c(scale(.)))
+  df.psych= left_join(all.factorScores.replication[[ifa]],
+                      data.replication.psych %>% dplyr::select(ID,Age,Gender.numeric,Education.numeric),by='ID') %>% dplyr::mutate_at(vars(-ID),~c(scale(.)))
+  df.replication.imputed.split[[ifa]] = func.splitDataTypes(df.task,df.psych,taskFactors.psychFactors.replication,loadings.summary)
+  # discovery
+  df.task = data.discovery.imputed %>% dplyr::mutate_at(vars(-ID),~c(scale(.)))
+  df.psych= left_join(all.factorScores.discovery[[ifa]],
+                      data.discovery.psych%>% dplyr::select(ID,Age,Gender.numeric,Education.numeric),by='ID') %>% dplyr::mutate_at(vars(-ID),~c(scale(.)))
+  df.discovery.imputed.split[[ifa]] = func.splitDataTypes(df.task,df.psych,taskFactors.psychFactors.discovery,loadings.summary)
+}
+```
+
+
+## Run machine learning
+We're running both the raw measures and the task factors
+
+```{r}
+#do.zscore='zscored' #notZscored must not set this here is this can go very wrong, having e.g. zscored above but storing it here as not zscored!
+overwrite=F
+this.folder=file.path(paths$replication,'Data','Preprocessed','MachineLearning','BRMSmodels',paste0('TrainedReplication_predictClinFactors_rawTaskMeasures_',do.zscore))
+suppressWarnings(dir.create(this.folder))
+suppressWarnings(dir.create(file.path(this.folder,'predictions')))
+q.factors=  c('IntolUncert', 'Anhedonia', 'Anxiety', 'Decentering', 'Apathy.behav','Apathy.emot','Compul.checking','Gender.numeric','Education.numeric','Age')
+fa.methods= c('Bartlett','Harman','Thurstone') #'tenBerge',
+reg.types=  c('TrainWithOtherClin','TrainWithoutOtherClin','Simple') # Simple: only the predictor, nothing else so that for R^2 we have a comparison model
+data.types= setdiff(names(df.replication.imputed.split$tenBerge),'ID')
+
+for (iq in q.factors){  
+  for (ifa in fa.methods){ 
+    for (ireg in reg.types){ 
+      for (idata in data.types){ 
+        print(paste('fititng BRMS modes', iq, ifa,ireg,idata,do.zscore))
+        this.file.brms = file.path(this.folder,paste0('BRM_',iq,'_',ifa,'_',ireg,'_',idata,'.RData'))
+        this.file.brms.summary = file.path(this.folder,paste0('BRM_',iq,'_',ifa,'_',ireg,'_',idata,'_BRMSsummary.txt'))
+        if (!file.exists(this.file.brms)|overwrite==T){
+          df= df.replication.imputed.split[[ifa]][[idata]] %>% na.omit() %>% dplyr::mutate_all(~c(scale(.))) 
+          task.vars = setdiff(colnames(df),q.factors)
+          # Create the formula
+          if (ireg=='TrainWithoutOtherClin'){
+            this.formula = paste0(iq,'~',paste(task.vars,collapse='+'))
+          } else if (ireg=='TrainWithOtherClin'){
+            this.formula = paste0(iq,'~',paste(c(task.vars,setdiff(q.factors,iq)),collapse='+'))
+          } else if (ireg=='Simple'){
+            this.formula=paste0(iq,'~1')
+          }
+          model=func.fitBRMS(df,this.formula)
+          save(model,file=this.file.brms)
+          sink(this.file.brms.summary)
+          print(this.formula)
+          print(model)
+          np              = nuts_params(model)
+          count_divergent = sum(subset(np,Parameter=="divergent__")$Value)
+          print(paste('count divergent', count_divergent))
+          sink()
+          rm(df,model)
+        } 
+        
+        
+        
+      }
+    }
+  }
+}
+```
+
+For future studies: fit models across both samples together, only for Bartlett, only for training without others
+```{r}
+#do.zscore='zscored' #notZscored must not set this here is this can go very wrong, having e.g. zscored above but storing it here as not zscored!
+overwrite=F
+this.folder=file.path(paths$replication,'Data','Preprocessed','MachineLearning','BRMSmodels',paste0('TrainedBothSamples_predictClinFactors_rawTaskMeasures_',do.zscore))
+suppressWarnings(dir.create(file.path(this.folder,'predictions'),recursive=T))
+suppressWarnings(dir.create(file.path(paths$stats,'MachineLearningBothSamplesRegWeights')))
+
+q.factors=  c('IntolUncert', 'Anhedonia', 'Anxiety', 'Decentering', 'Apathy.behav','Apathy.emot','Compul.checking','Gender.numeric','Education.numeric','Age')
+fa.methods= c('Bartlett') #,'Harman','Thurstone') #'tenBerge',
+reg.types=  c('TrainWithoutOtherClin') #c('TrainWithOtherClin','TrainWithoutOtherClin','Simple') # Simple: only the predictor, nothing else so that for R^2 we have a comparison model
+data.types= setdiff(names(df.replication.imputed.split$tenBerge),'ID')
+
+for (iq in q.factors[c(7,1,2,3,4,5,6,8,9,10)]){  
+  for (ifa in fa.methods){ 
+    for (ireg in reg.types){ 
+      for (idata in data.types){ 
+        print(paste('fititng BRMS modes', iq, ifa,ireg,idata,do.zscore))
+        this.file.brms = file.path(this.folder,paste0('BRM_',iq,'_',ifa,'_',ireg,'_',idata,'.RData'))
+        this.file.brms.summary = file.path(this.folder,paste0('BRM_',iq,'_',ifa,'_',ireg,'_',idata,'_BRMSsummary.txt'))
+        if (!file.exists(this.file.brms)|overwrite==T){
+          df=rbind(df.replication.imputed.split[[ifa]][[idata]],
+                   df.discovery.imputed.split[[ifa]][[idata]]) %>% na.omit() %>% dplyr::mutate_all(~c(scale(.))) 
+          
+         # df= df.replication.imputed.split[[ifa]][[idata]] %>% na.omit() %>% dplyr::mutate_all(~c(scale(.))) 
+          task.vars = setdiff(colnames(df),q.factors)
+          # Create the formula
+          if (ireg=='TrainWithoutOtherClin'){
+            this.formula = paste0(iq,'~',paste(task.vars,collapse='+'))
+          } else if (ireg=='TrainWithOtherClin'){
+            this.formula = paste0(iq,'~',paste(c(task.vars,setdiff(q.factors,iq)),collapse='+'))
+          } else if (ireg=='Simple'){
+            this.formula=paste0(iq,'~1')
+          }
+          model=func.fitBRMS(df,this.formula)
+          save(model,file=this.file.brms)
+         # browser()
+          sink(this.file.brms.summary)
+          print(this.formula)
+          print(model)
+          np              = nuts_params(model)
+          count_divergent = sum(subset(np,Parameter=="divergent__")$Value)
+          print(paste('count divergent', count_divergent))
+          sink()
+          # Extract and store the reg weights
+          t=as.data.frame(fixef(model))
+          write.csv(t,file.path(paths$stats,'MachineLearningBothSamplesRegWeights',paste0('MachineLearningBothSamples_RegWeights_',iq,'_',idata,'.csv')))
+          rm(df,model)
+        } 
+        
+        
+        
+      }
+    }
+  }
+}
+```
+
+## Get and test predictions
+```{r}
+
+# Make predictions and check their goodness
+
+# parallel for the permutation tests
+
+cores=10 #detectCores()
+cl=makeCluster(cores)
+registerDoParallel(cl)
+do.accuracy.perm=T # just so we can run it more quickly because v slow 
+
+stats.file.pval.corr= file.path(paths$stats,paste0('Revision2_MachineLearning_correlation_pval_',do.zscore,'.csv'))
+stats.file.estimate.corr= file.path(paths$stats,paste0('Revision2_MachineLearning_correlation_estimate_',do.zscore,'.csv'))
+stats.file.pval.reg= file.path(paths$stats,paste0('Revision2_MachineLearning_regression_pval_',do.zscore,'.csv'))
+stats.file.estimate.reg= file.path(paths$stats,paste0('Revision2_MachineLearning_regression_estimate_',do.zscore,'.csv'))
+stats.file.pval.reg.shortened= file.path(paths$stats,paste0('Revision2_MachineLearning_regression_pval_short_',do.zscore,'.csv'))
+stats.file.estimate.reg.shortened= file.path(paths$stats,paste0('Revision2_MachineLearning_regression_estimate_short_',do.zscore,'.csv'))
+stats.file.pval.R2= file.path(paths$stats,paste0('Revision2_MachineLearning_R2_pval_',do.zscore,'.csv'))
+stats.file.estimate.R2= file.path(paths$stats,paste0('Revision2_MachineLearning_R2_estimate_',do.zscore,'.csv'))
+
+summary.pval.cor.all= data.frame()
+summary.estimate.cor.all= data.frame()
+summary.pval.reg.all=data.frame()
+summary.estimate.reg.all=data.frame()
+summary.pval.reg.all.shortened=data.frame()
+summary.estimate.reg.all.shortened=data.frame()
+summary.pval.R2=data.frame()
+summary.estimate.R2 = data.frame()
+
+this.folder=file.path(paths$replication,'Data','Preprocessed','MachineLearning','BRMSmodels',paste0('TrainedReplication_predictClinFactors_rawTaskMeasures_',do.zscore))
+q.factors=  c('IntolUncert', 'Anhedonia', 'Anxiety', 'Decentering', 'Apathy.behav','Apathy.emot','Compul.checking','Gender.numeric','Education.numeric','Age')
+fa.methods= c('Bartlett','Harman','Thurstone')
+reg.types=  c('TrainWithOtherClin','TrainWithoutOtherClin','Simple') # Simple: only the predictor, nothing else so that for R^2 we have a comparison model
+data.types= setdiff(names(df.replication.imputed.split$tenBerge),'ID')
+
+this.intermediateSave=file.path(paths$stats,'Revision2_MachineLearning_dataTypeWise')
+suppressWarnings(dir.create(this.intermediateSave))
+
+for (idata in data.types){
+  temp.file= file.path(this.intermediateSave,paste0(idata,'_',do.zscore,'.RData'))
+  if (file.exists(temp.file)){
+    load(temp.file)
+  } else{
+  for (ireg in c('TrainWithOtherClin','TrainWithoutOtherClin')){  # 'simple' is needed for both, rather than as its own model
+
+    for (ifa in fa.methods){
+      print(paste('testing predictions', ifa,ireg,idata))
+      stats.file.tabcorr =   file.path(paths$stats,paste0('Revision2_MachineLearning_rawTask_',do.zscore),paste0('Revision2_MachineLearning_',ifa,'_',ireg,'_',idata,'corrs.html'))
+      summary.pval.regT=data.frame(x=c('(Intercept)',paste0(q.factors,'_true')))
+      summary.estimate.regT = summary.pval.regT
+      summary.pval.reg.shortT= data.frame(matrix(data=NA,nrow=1,ncol=0)) 
+      summary.estimate.reg.shortT= data.frame(matrix(data=NA,nrow=1,ncol=0)) 
+        
+      preds.discovery=data.frame(ID=df.discovery.imputed.split$tenBerge$ID)
+      cors.pT=data.frame(matrix(data=NA,nrow=1,ncol=0)) 
+      cors.estT=data.frame(matrix(data=NA,nrow=1,ncol=0))
+      R2.pT=data.frame(matrix(data=NA,nrow=1,ncol=0))
+      R2.estT=data.frame(matrix(data=NA,nrow=1,ncol=0))
+      for (iq in q.factors){ 
+        this.file.brms = file.path(this.folder,paste0('BRM_',iq,'_',ifa,'_',ireg,'_',idata,'.RData'))
+        if (!file.exists(this.file.brms)){
+          print('brms model does not exist') 
+          browser()
+        }
+        
+        
+        # Create predictions
+        df=df.discovery.imputed.split[[ifa]][[idata]] 
+        df$ID= df.discovery.imputed.split[[ifa]]$ID
+        true=df %>% dplyr::select(all_of(q.factors),ID) %>% dplyr::rename_at(vars(-ID),~paste0(.,'_true'))
+        df=df%>% na.omit()
+        if (iq=='Gender.numeric'){
+          df=df %>% dplyr::filter(Gender.numeric==min(Gender.numeric)| Gender.numeric==max(Gender.numeric)) %>%
+          dplyr::mutate(Gender.numeric=round(Gender.numeric)) %>% dplyr::mutate(Gender.numeric=factor(Gender.numeric)) %>%
+           dplyr::mutate(Gender.numeric=recode_factor(Gender.numeric,`-1`='Female',`1`='Male')) 
+          df= df %>% na.omit() %>% dplyr::mutate_at(vars(-ID,-Gender.numeric),~c(scale(.))) 
+        } else{
+          df= df %>% na.omit() %>% dplyr::mutate_at(vars(-ID),~c(scale(.))) 
+        }
+        load(this.file.brms) # model
+        pred=func.makePrediction_rawTask(df,model,ireg,q.factors)
+        rm(model)
+        this.file.brms.control = file.path(this.folder,paste0('BRM_',iq,'_',ifa,'_Simple_',idata,'.RData'))
+        load(this.file.brms.control) # model
+        pred.control=func.makePrediction_rawTask(df,model,ireg,q.factors)
+        
+        df.reg= pred %>% dplyr::select(Estimate) %>% dplyr::rename({{iq}} :=Estimate) %>% dplyr::mutate(ID =df$ID)
+
+        df.withTrue = left_join(df.reg,
+                                true,by='ID')
+        preds.discovery=left_join(preds.discovery,df.reg,by='ID')
+        rm(df,model)
+        
+        # Compare predictions to true with regression
+        this.formula= paste0(iq,'~',paste(paste0(q.factors,'_true'),collapse='+'))
+        out=lm(this.formula,data=df.withTrue)
+        t=as.data.frame(summary(out)$coefficients) %>%tibble::rownames_to_column()
+        summary.pval.regT = left_join(summary.pval.regT,t%>%dplyr::select(rowname,`Pr(>|t|)`) %>% dplyr::rename({{iq}}:=`Pr(>|t|)`), by=c('x'='rowname')  )
+        summary.estimate.regT = left_join(summary.estimate.regT,t%>%dplyr::select(rowname,Estimate) %>% dplyr::rename({{iq}}:=Estimate), by=c('x'='rowname')  )
+        summary.pval.reg.shortT[[iq]] = t %>% dplyr::filter(rowname==paste0(iq,'_true')) %>% select(`Pr(>|t|)`)   %>% pull(`Pr(>|t|)`) 
+        summary.estimate.reg.shortT[[iq]] = t %>% dplyr::filter(rowname==paste0(iq,'_true')) %>% select(Estimate) %>% pull(Estimate) 
+       
+         # compare predictions to true with correlation on % correct
+        if (iq!='Gender.numeric'){
+          this.cor=cor.test(df.withTrue[[iq]],df.withTrue[[paste0(iq,'_true')]])
+        } else{
+          if (do.accuracy.perm==T){
+            out=func.getPredStatGender(df.withTrue,nperm)
+            this.cor$p.value=out$p
+            this.cor$estimate = out$accuracy$perc.cor
+          } else{
+            this.cor$p.value=NA
+            this.cor$estimate = NA
+          }
+        }
+        cors.pT[[iq]] =this.cor$p.value
+        cors.estT[[iq]] =this.cor$estimate
+        
+        # compare predictions to true with out-of-sample R^2
+        # !! DO check correct brackets
+        y=df.withTrue[[paste0(iq,'_true')]]
+        out=func.R2(y, df.withTrue[[iq]], pred.control$Estimate, nperm) #y,yhat.full,yhat.simple,nsamp
+        R2.pT[[iq]]=out$p.R2
+        R2.estT[iq]=out$R2.true
+        
+      
+      if (is.na(cors.pT[[iq]])| is.na(cors.estT[[iq]])){ # detect a problem 
+        browser()
+      }
+    }
+      
+      summary.pval.cor.all = rbind(summary.pval.cor.all,         cors.pT %>% dplyr::mutate(fa.method=ifa,initialTrainingType=ireg,task.data.type=idata))
+      summary.estimate.cor.all= rbind(summary.estimate.cor.all,cors.estT %>% dplyr::mutate(fa.method=ifa,initialTrainingType=ireg,task.data.type=idata))
+      summary.pval.reg.all = rbind(summary.pval.reg.all, summary.pval.regT %>% dplyr::mutate(fa.method=ifa,initialTrainingType=ireg,task.data.type=idata))
+      summary.estimate.reg.all = rbind(summary.estimate.reg.all, summary.estimate.regT %>% dplyr::mutate(fa.method=ifa,initialTrainingType=ireg,task.data.type=idata))
+      summary.pval.reg.all.shortened = rbind(summary.pval.reg.all.shortened, summary.pval.reg.shortT%>% dplyr::mutate(fa.method=ifa,initialTrainingType=ireg,task.data.type=idata))
+      summary.estimate.reg.all.shortened = rbind(summary.estimate.reg.all.shortened, summary.estimate.reg.shortT%>% dplyr::mutate(fa.method=ifa,initialTrainingType=ireg,task.data.type=idata))
+      summary.pval.R2=rbind(summary.pval.R2, R2.pT%>% dplyr::mutate(fa.method=ifa,initialTrainingType=ireg,task.data.type=idata))
+      summary.estimate.R2=rbind(summary.estimate.R2, R2.estT%>% dplyr::mutate(fa.method=ifa,initialTrainingType=ireg,task.data.type=idata))
+      # also make condensed version that looks like for cor
+
+      print(tab_corr(left_join(preds.discovery,true,by='ID'),file=stats.file.tabcorr))
+      
+      #write.csv(preds.discovery,file=file.preds)
+      rm(preds.discovery)
+     
+    }
+  }
+    save(summary.pval.cor.all,summary.estimate.cor.all,summary.pval.reg.all,summary.estimate.reg.all,summary.pval.reg.all.shortened,
+         summary.estimate.reg.all.shortened,summary.pval.R2,summary.estimate.R2, file=temp.file)
+}
+}
+# will overwrite in loop, but like this can open intermittently to look
+write.csv(summary.pval.reg.all,file=stats.file.pval.reg)
+write.csv(summary.estimate.reg.all,file=stats.file.estimate.reg)
+write.csv(summary.pval.reg.all.shortened,file=stats.file.pval.reg.shortened)
+write.csv(summary.estimate.reg.all.shortened,file=stats.file.estimate.reg.shortened)
+write.csv(summary.pval.R2,file=stats.file.pval.R2)
+write.csv(summary.estimate.R2,file=stats.file.estimate.R2)
+
+
+
+if (do.accuracy.perm==T){
+write.csv(summary.pval.cor.all,file=stats.file.pval.corr)
+write.csv(summary.estimate.cor.all,file=stats.file.estimate.corr)
+}
+stopCluster(cl)
+
+```
+
+Analysing to compare the results:
+We have very big tables. The questions:
+- difference whether judged by correlation or regression? Let's focus on regressions first to simplify
+- difference whether trained with or without other clinical? Let's focus on without other clinical first, as most similar to what was done previously, but we should also check the other one
+- difference according to FA extraction? For now, to simplify let's focus on analyses run where every task measure was included
+
+Preprocessing: if etsimates <0 ,set p to 1 and others divide by 2 for one-tailed
+Looking across the results table, the specific combination FA method - train with/without other clinical seem to have a big impact
+
+Looking at counts to see whether there are big differences between the methods.
+- Which type of factor analysis? - Harman is the most significant when training with other clinical subscales, but given considerations above (e.g. does not capture well different correlation structure between samples), will use Bartlett
+- What initial training? to my surprise (as that's what the regression is testing!), training without other clinical scores is somewhat better
+- Zscoring or not? makes very little difference (one better for some, other for others). zscoring seems a bit more sensible as we also always zscore everything else
+```{r}
+q.factors=  c('IntolUncert', 'Anhedonia', 'Anxiety', 'Decentering', 'Apathy.behav','Apathy.emot','Compul.checking','Gender.numeric','Education.numeric','Age')
+
+# pre-process: set neg estimates to p=1
+p.zscored = read.csv(file.path(paths$stats,paste0('Revision2_MachineLearning_regression_pval_short_zscored.csv'))) %>% dplyr::select(-X) %>% dplyr::mutate(zscoring='zscored')
+p.notzscored = read.csv(file.path(paths$stats,paste0('Revision2_MachineLearning_regression_pval_short_notZscored.csv'))) %>% dplyr::select(-X) %>% dplyr::mutate(zscoring='notZscored')
+p = rbind(p.zscored,p.notzscored)
+e.zscored = read.csv(file.path(paths$stats,paste0('Revision2_MachineLearning_regression_estimate_short_zscored.csv')))%>% dplyr::select(-X) %>% dplyr::mutate(zscoring='zscored')
+e.notzscored = read.csv(file.path(paths$stats,paste0('Revision2_MachineLearning_regression_estimate_short_notZscored.csv')))%>% dplyr::select(-X) %>% dplyr::mutate(zscoring='notZscored')
+e = rbind(e.zscored,e.notzscored)
+inds=(e %>% dplyr::select(-fa.method,-initialTrainingType,-task.data.type,-zscoring) <0) 
+inds.corDir=(e %>% dplyr::select(-fa.method,-initialTrainingType,-task.data.type,-zscoring) >0) 
+pt = p%>% dplyr::select(-fa.method,-initialTrainingType,-task.data.type,-zscoring)
+pt[inds]= 1
+pt[inds.corDir] = pt[inds.corDir]/2
+pt = cbind(pt,p %>% dplyr::select(fa.method,initialTrainingType,task.data.type,zscoring))
+pt.regr=pt
+# Print summarized results
+
+
+# Get counts of significance with different methods
+t=pt %>% pivot_longer(.,cols=all_of(q.factors),names_to='Q.Factor',values_to='p.val') %>% dplyr::filter(p.val<0.05) %>%
+  dplyr::arrange(Q.Factor)
+count.FAtype.byQ = t %>% dplyr::group_by(Q.Factor,fa.method) %>% dplyr::summarize(count=n())
+count.FAtype = t %>% dplyr::group_by(fa.method) %>% dplyr::summarize(count=n())
+count.trainType.byFA=t %>% dplyr::group_by(initialTrainingType,fa.method) %>% dplyr::summarize(count=n())
+count.trainType.byFA.byQ=t %>% dplyr::group_by(initialTrainingType,fa.method,Q.Factor) %>% dplyr::summarize(count=n())%>%dplyr::arrange(Q.Factor)
+count.trainType.byQ=t %>% dplyr::group_by(initialTrainingType,Q.Factor) %>% dplyr::summarize(count=n())%>%dplyr::arrange(Q.Factor)
+count.trainType = t %>% dplyr::group_by(initialTrainingType) %>% dplyr::summarize(count=n()) 
+count.zscore.byFa.byTrainType =t %>% dplyr::group_by(zscoring,initialTrainingType,fa.method)%>% dplyr::summarize(count=n()) 
+count.zscoredBartlett.byTrainType.byQ = t %>% dplyr::filter(zscoring=='zscored',fa.method=='Bartlett') %>% dplyr::group_by(Q.Factor,initialTrainingType)%>% dplyr::summarize(count=n()) 
+count.zscoredBartlett.byTrainType.byQ = t %>% dplyr::filter(zscoring=='zscored',fa.method=='Bartlett') %>% 
+  dplyr::group_by(Q.Factor ,initialTrainingType) %>% dplyr::summarize(count=n()) 
+count.zscoredBartlett.byTrainType.byTaskDAtaType = t %>% dplyr::filter(zscoring=='zscored',fa.method=='Bartlett') %>% 
+  dplyr::group_by(task.data.type ,initialTrainingType) %>% dplyr::summarize(count=n()) 
+write.csv(count.zscore.byFa.byTrainType,file=file.path(paths$stats,paste0('Revision2_MachineLearning_regression_summary_zscoring_FAtype_trainingWithOrWithoutOtherClin_summary_count_significant.csv')))
+
+recodes.old = c('allTask_debrief',
+                'allTask',
+                'compoundTask_indivChoiceModel_noMood',
+                'compoundTask_noMood',
+                'indivChoiceModel',
+                'allTask_rewardInteractionsOnly',
+                'mood_related',
+                'debrief')
+recodes =  c('Task (aggr+SC+mood) + self rep',
+             'Task (aggr+SC+mood)',
+             'Task (aggr+SC)', #,'Task + self rep',
+             'Task (aggr only)',
+             'Task (SC only)',
+             'Task (reward eff. only)',
+             'Task (mood only)',
+             'Self rep only')
+names(recodes)=recodes.old
+
+
+summary.table= pt %>% pivot_longer(.,cols=all_of(q.factors),names_to='Q.Factor',values_to='p.val') %>% 
+  dplyr::filter(fa.method=='Bartlett' &initialTrainingType=='TrainWithoutOtherClin'&zscoring=='zscored' & !stringr::str_detect(task.data.type,'TaskFactor_') ) %>%
+  dplyr::select(Q.Factor,p.val,task.data.type) %>% 
+  dplyr::mutate(task.data.type=recode(task.data.type,!!!recodes),
+                `p (one-tailed)`=case_when(p.val < 10^-5 ~ "p<10e-5",
+                                           p.val < 10^-4 ~ "p<10e-4",
+                                           p.val < 10^-3 ~ "p<0.001",
+                                           p.val < 10^-2 ~ "p<0.01",
+                                           p.val < 0.05 ~ 'p<0.05',
+                                           T ~ paste0('p=',round(p.val,digits=2)))) %>% 
+  pivot_wider(.,id_cols='Q.Factor',values_from='p (one-tailed)',names_from='task.data.type')
+write.csv(summary.table,file=file.path(paths$stats,paste0('Revision2_MachineLearning_regression_summary_zscored_TrainWithoutOtherClin_Bartlett.csv')))
+
+# the same for task factors
+summary.table= pt %>% pivot_longer(.,cols=all_of(q.factors),names_to='Q.Factor',values_to='p.val') %>% 
+  dplyr::filter(fa.method=='Bartlett' &initialTrainingType=='TrainWithoutOtherClin'&zscoring=='zscored' & stringr::str_detect(task.data.type,'TaskFactor_') ) %>%
+  dplyr::select(Q.Factor,p.val,task.data.type) %>% 
+  dplyr::mutate(task.data.type=recode(task.data.type,!!!recodes),
+                `p (one-tailed)`=case_when(p.val < 10^-5 ~ "p<10e-5",
+                                           p.val < 10^-4 ~ "p<10e-4",
+                                           p.val < 10^-3 ~ "p<0.001",
+                                           p.val < 10^-2 ~ "p<0.01",
+                                           p.val < 0.05 ~ 'p<0.05',
+                                           T ~ 'ns')) %>% 
+  pivot_wider(.,id_cols='Q.Factor',values_from='p (one-tailed)',names_from='task.data.type')
+write.csv(summary.table,file=file.path(paths$stats,paste0('Revision2_MachineLearning_regression_summary_zscored_TrainWithoutOtherClin_Bartlett_taskFactorsOnly.csv')))
+
+
+# the same for correlations (only Bartlett, only zscored, only trained without other clinical)
+p = read.csv(file.path(paths$stats,paste0('Revision2_MachineLearning_correlation_pval_zscored.csv'))) %>% dplyr::select(-X)
+e = read.csv(file.path(paths$stats,paste0('Revision2_MachineLearning_correlation_estimate_zscored.csv')))%>% dplyr::select(-X)
+#e.notzscored = read.csv(file.path(paths$stats,paste0('Revision2_MachineLearning_regression_estimate_short_notZscored.csv')))%>% dplyr::select(-X) %>% dplyr::mutate(zscoring='notZscored')
+#e = rbind(e.zscored,e.notzscored)
+inds=(e %>% dplyr::select(-fa.method,-initialTrainingType,-task.data.type) <0) 
+inds.corDir=(e %>% dplyr::select(-fa.method,-initialTrainingType,-task.data.type) >0) 
+pt = p%>% dplyr::select(-fa.method,-initialTrainingType,-task.data.type)
+pt[inds]= 1
+pt[inds.corDir] = pt[inds.corDir]/2
+pt = cbind(pt,p %>% dplyr::select(fa.method,initialTrainingType,task.data.type))
+pt.cor= pt
+pt.stars = pt %>% dplyr::filter(fa.method=='Bartlett' & initialTrainingType=='TrainWithoutOtherClin' & !stringr::str_detect(task.data.type,'TaskFactor'))  %>% dplyr::select(-fa.method,-initialTrainingType) %>% 
+    dplyr::mutate(task.data.type=recode(task.data.type,!!!recodes)) %>%
+
+  pivot_longer(-task.data.type) %>%
+  dplyr::mutate(value.star= case_when(value<0.0001 ~ '****',
+                                      value <0.001 ~ '***',
+                                      value<0.01 ~ '**',
+                                      value <0.05 ~ '*',
+                                      T ~ ' (ns)'))
+
+# For the correlations, print a table with correlation values (+stars for significance)
+e = read.csv(file.path(paths$stats,paste0('Revision2_MachineLearning_correlation_estimate_zscored.csv')))%>% dplyr::select(-X)%>% 
+  dplyr::mutate_if(is.numeric,~round(.,digits=2)) %>% 
+  dplyr::filter(fa.method=='Bartlett' & initialTrainingType=='TrainWithoutOtherClin' & !stringr::str_detect(task.data.type,'TaskFactor')) %>%
+  dplyr::mutate(task.data.type=recode(task.data.type,!!!recodes)) %>%
+  dplyr::select(-fa.method,-initialTrainingType) %>% pivot_longer(-task.data.type) %>%
+  left_join(.,pt.stars %>% dplyr::select(task.data.type,name,value.star),by=c('task.data.type','name')) %>%
+  dplyr::mutate(value.and.star=paste0(value,value.star)) %>% dplyr::select(task.data.type,name,value.and.star)%>%
+  pivot_wider(values_from='value.and.star',names_from='task.data.type')
+write.csv(e,file=file.path(paths$stats,paste0('Revision2_MachineLearning_regression_summary_zscored_TrainWithoutOtherClin_Bartlett_correlationStrengths.csv')))
+
+
+# For the methods paper: compare the methods
+summary.table.regression= pt.regr %>% pivot_longer(.,cols=all_of(q.factors),names_to='Q.Factor',values_to='p.val') %>% 
+  dplyr::filter( initialTrainingType=='TrainWithoutOtherClin'&zscoring=='zscored' & !stringr::str_detect(task.data.type,'TaskFactor_') & task.data.type=='compoundTask_indivChoiceModel_noMood')  %>%
+  dplyr::select(fa.method,Q.Factor,p.val) %>%
+  pivot_wider(.,names_from='Q.Factor',values_from='p.val') %>% dplyr::select(-Gender.numeric,-Education.numeric,-Age)
+
+summary.table.cor= pt.cor %>% pivot_longer(.,cols=all_of(q.factors),names_to='Q.Factor',values_to='p.val') %>% 
+  dplyr::filter( initialTrainingType=='TrainWithoutOtherClin'&  !stringr::str_detect(task.data.type,'TaskFactor_') & task.data.type=='compoundTask_indivChoiceModel_noMood')  %>%
+  dplyr::select(fa.method,Q.Factor,p.val) %>%
+  pivot_wider(.,names_from='Q.Factor',values_from='p.val') %>% dplyr::select(-Gender.numeric,-Education.numeric,-Age)
+
+#write.csv(summary.table,file=file.path(paths$stats,paste0('Revision2_MachineLearning_regression_summary_zscored_TrainWithoutOtherClin_Bartlett.csv')))
+
+```
+
+For the task factors:
+- for each clinical, for each regression that was significant, which factors were significant
+- table for each factor which behaviours included (already made this above, just changing the format here)
+```{r}
+summary.table=read.csv(file.path(paths$stats,paste0('Revision2_MachineLearning_regression_summary_zscored_TrainWithoutOtherClin_Bartlett_taskFactorsOnly.csv'))) %>% dplyr::select(-X)
+significant.factors=data.frame()
+for (itask in c('TaskFactor_Task.Comp','TaskFactor_Mood','TaskFactor_Debrief','TaskFactor_Everything')){
+    for (iq in unique(summary.table$Q.Factor)){
+    print(paste(iq,itask))
+    if (summary.table %>% dplyr::filter(Q.Factor==iq) %>% pull(itask) !='ns'){
+      this.folder=file.path(paths$replication,'Data','Preprocessed','MachineLearning','BRMSmodels','TrainedReplication_predictClinFactors_rawTaskMeasures_zscored')
+      load(file.path(this.folder,paste0('BRM_',iq,'_Bartlett_TrainWithoutOtherClin_',itask,'.RData')))# model load the BRMS model
+      t=as.data.frame(fixef(model)) %>% tibble::rownames_to_column() %>% dplyr::filter(sign(`Q2.5`)==sign(`Q97.5`)) %>% pull(rowname)
+      if (length(t)==0){
+        t= 'NA'
+      } 
+      significant.factors= bind_rows(significant.factors,
+                                     data.frame(Q.Factor= iq, Task.Factor=itask, Significant.Factors = paste(t,collapse=', ')))
+
+    }
+  }
+}
+
+significant.factorst=significant.factors %>% 
+  dplyr::mutate(Task.Factor=factor(Task.Factor,ordered=T,levels=c('TaskFactor_Task.Comp','TaskFactor_Mood','TaskFactor_Debrief','TaskFactor_Everything'))) %>% dplyr::arrange(Task.Factor) %>% dplyr::filter(Significant.Factors!='NA') %>%
+  dplyr::mutate(Task.Factor = recode(Task.Factor,'TaskFactor_Task.Comp'='Task behaviour','TaskFactor_Debrief'='Post-task self report','TaskFactor_Everything'='Everything'),
+                Q.Factor=recode(Q.Factor,'Gender.numeric'='Gender','Apathy.emot'='Apathy (emot)','Apathy.behav'='Apathy (behav)','Education.numeric'='Education'))
+write.csv(significant.factorst,file=file.path(paths$stats,paste0('Revision2_MachineLearning_regression_summary_zscored_TrainWithoutOtherClin_Bartlett_taskFactorsOnly_individuallySignificantFactors.csv')))
+
+# sort the loadings 
+loadings=read.csv(file.path(paths$stats,'Revision2_FactorAnalysis_loadingsFilteredAt04_cor0.9.csv')) %>% dplyr::select(-X) %>%
+  dplyr::mutate(Sign=case_when(value>0 ~ 'Positive', T ~ 'Negative')) %>% dplyr::select(factor,name,Sign) 
+measure.perFactor=data.frame()
+for (it in unique(loadings$factor)){
+  t.pos= loadings %>% dplyr::filter(factor==it & Sign=='Positive') %>% pull(name) %>% paste(.,collapse=', ')
+  t.neg= loadings %>% dplyr::filter(factor==it & Sign=='Negative') %>% pull(name) %>% paste(.,collapse=', ')
+  measure.perFactor = bind_rows(measure.perFactor,
+                                data.frame(Task.Factor=it,Positive.Loadings=t.pos,Negative.Loadings=t.neg))
+}
+write.csv(measure.perFactor,file=file.path(paths$stats,paste0('Revision2_FactorAnalysis_loadingsFilteredAt04_cor0.9_condensedFormat.csv')))
+```
+
+
+
+## Figure of R^2
+```{r}
+R2.p = read.csv(file.path(paths$stats,'Revision2_MachineLearning_R2_pval_zscored.csv')) %>%
+  dplyr::filter(fa.method=='Bartlett' & initialTrainingType=='TrainWithoutOtherClin')
+R2.est= read.csv(file.path(paths$stats,'Revision2_MachineLearning_R2_estimate_zscored.csv'))%>%
+  dplyr::filter(fa.method=='Bartlett' & initialTrainingType=='TrainWithoutOtherClin')
+
+recodes.old = c('allTask_debrief',
+                'allTask',
+                'compoundTask_indivChoiceModel_noMood',
+                'compoundTask_noMood',
+                'indivChoiceModel',
+                'allTask_rewardInteractionsOnly',
+                'mood_related',
+                'debrief')
+recodes =  c('Task (aggr+SC+mood) + self rep',
+             'Task (aggr+SC+mood)',
+             'Task (aggr+SC)', #,'Task + self rep',
+             'Task (aggr only)',
+             'Task (SC only)',
+             'Task (reward eff. only)',
+             'Task (mood only)',
+             'Self rep only')
+names(recodes)=recodes.old
+
+
+df.orig = R2.est %>% dplyr::mutate(task.data.type=recode(task.data.type,!!!recodes)) %>% dplyr::select(-fa.method,-initialTrainingType,-X) %>%
+  pivot_longer(-task.data.type) %>% 
+  dplyr::mutate(value=case_when(value<0 ~ 0, T ~ value)) %>% # remove negative R^2
+  pivot_wider(id_cols=name,values_from=value,names_from=task.data.type)  
+df=df.orig%>%
+  dplyr::mutate(Sum.Selfrep.TaskMood.TaskAggr.TaskSC = `Self rep only`+ `Task (aggr+SC+mood)`,
+                `Self rep only` = `Self rep only` / Sum.Selfrep.TaskMood.TaskAggr.TaskSC * `Task (aggr+SC+mood) + self rep`,
+                `Task (aggr+SC+mood)` = `Task (aggr+SC+mood)` / Sum.Selfrep.TaskMood.TaskAggr.TaskSC * `Task (aggr+SC+mood) + self rep`,
+                check.step1= `Self rep only`+`Task (aggr+SC+mood)` ,
+                Sum.TaskMood.TaskAggr.TaskSC = `Task (mood only)` + `Task (aggr+SC)`,
+                `Task (mood only)` = `Task (mood only)`/Sum.TaskMood.TaskAggr.TaskSC*`Task (aggr+SC+mood)`,
+                `Task (aggr+SC)`=`Task (aggr+SC)`/Sum.TaskMood.TaskAggr.TaskSC*`Task (aggr+SC+mood)`,
+                 check.step2=   `Task (mood only)`+`Task (aggr+SC)`,
+                Sum.TaskAggr.TaskSC=`Task (aggr only)` + `Task (SC only)`,
+                `Task (aggr only)` = `Task (aggr only)`/Sum.TaskAggr.TaskSC* `Task (aggr+SC)`,
+                `Task (SC only)`   = `Task (SC only)`/Sum.TaskAggr.TaskSC*`Task (aggr+SC)`,
+                check.sum=`Task (SC only)`+`Task (aggr only)`+`Task (mood only)`+`Self rep only`) 
+                
+
+
+ df.plot = df %>% dplyr::select(name,"Task (SC only)","Task (aggr only)","Task (mood only)","Self rep only") %>%
+   dplyr::mutate_if(is.numeric,~pmax(0,.)) %>% # remove negative values
+   pivot_longer(cols=-name,values_to='R^2',names_to='Data type') %>%
+   dplyr::filter(!name %in% c('Age','Education.numeric')) %>%
+   dplyr::mutate(name=recode(name,'Gender.numeric'='Gender'))
+   #%>%
+   # dplyr::mutate(`Clin/demogr`=recode(`Clin/demogr`,'oci'='Compul. checking','apathyMotivationIndex_Behavioural'='Apathy (behav)','apathyMotivationIndex_Emotional'='Apathy (emot)',
+   #                              'shaps'='Anhedonia',"intolUncert_ProspectAnx"='Intol uncert (prosp anx)','intolUncert_InhibAnx'='Intol uncert (inhib anx)','sticsa.trait.cognitive'='Anx (cognit)','sticsa.trait.somatic' = 'Anx (somatic)','decentering'='Decentering','Gender.numeric'='Gender')) 
+   #                         
+                
+plots=ggplot(df.plot,aes(fill=`Data type`,x=name,y=`R^2`))+
+  geom_bar(position="stack",stat="identity")+ coord_flip() +
+  theme_bw()+theme(axis.text.x=element_text(angle=45,vjust=0.5),text=element_text(size=27))+
+  labs(y = expression(paste("Out-of-sample ", R^2)))+rremove('ylab')+
+  ggtitle('')+theme(plot.title = element_text(hjust=-0.3)) #D Exploratory Machine learning
+
+ggexport(plots,filename=file.path(paths$figures,paste0('Revision2_MachineLearning_brms_summaryR2_clinicalFactors','.jpg')), width=18*400,height=6*400,res=400)
+ggexport(plots,filename=file.path(paths$figures,paste0('Paper_MainFigure3_MachineLearningPartWthSignifStars.pdf')), width=18,height=6)
+
+```
+
+
+## Identifying individual predictors
+We can identify predictors in three ways:
+- significant in regression clin ~ task1 + task2 +...
+- significant in task1 ~ clin1+ clin2 + .... + demographics
+- significant in task 1 ~ clin1 + demographics
+
+Regressions task ~ clin1 (+other clin)+ demographics
+```{r}
+my.prior=c(prior(normal(0,0.1),class='Intercept'),prior(normal(0,1),class='b')) # because i've z-scored, the intercept should be zero
+q.factors=  c('IntolUncert', 'Anhedonia', 'Anxiety', 'Decentering', 'Apathy.behav','Apathy.emot','Compul.checking','Gender.numeric','Education.numeric','Age')
+demogr= c('Gender.numeric','Education.numeric','Age')
+clin.fs = setdiff(q.factors,demogr)
+
+if (do.zscore!='zscored'){
+  browser() 
+  # note: the first code that creates the split data frames should be run as it loads all the data that we need
+  # load the imputed data (i.e. the data that we also used in the machine learning) and the questionnaire factor scores
+}
+# combine discovery and replication sample
+df.fullT = rbind(df.replication.imputed.split$Bartlett$allTask_debrief %>% 
+                   dplyr::mutate(Gender.numeric=round(Gender.numeric)) %>% dplyr::mutate(Gender.numeric=factor(Gender.numeric))  %>%
+                   dplyr::mutate(Gender.numeric=recode_factor(Gender.numeric,`-1`='Female',`1`='Male',`0`='Other')),
+                 df.discovery.imputed.split$Bartlett$allTask_debrief %>% 
+                   dplyr::mutate(Gender.numeric=round(Gender.numeric)) %>% dplyr::mutate(Gender.numeric=factor(Gender.numeric))  %>%
+                   dplyr::mutate(Gender.numeric=recode_factor(Gender.numeric,`-1`='Female',`1`='Male',`0`='Other')) %>% 
+                   dplyr::mutate_if(is.numeric,scale))
+behavs=setdiff(colnames(df.fullT),q.factors)
+this.folder=file.path(paths$replication,'Data','Preprocessed','MachineLearning','Individual.predictors') # make a folder to store results
+suppressWarnings(dir.create(this.folder,recursive=T))
+# for each clinical factor
+
+results= data.frame()
+for (iq in q.factors){ #[8:1]
+  print(iq) 
+  if (iq=='Gender.numeric'){
+    df.full=df.fullT %>% dplyr::filter(Gender.numeric %in% c('Female','Male')) %>% dplyr::mutate_if(is.numeric,scale)
+  } else{
+    df.full=df.fullT
+  }
+  # make generic regressions: a) clin + other clin + demographics, b) other clin + demographics only, c) clin + demogrphaics, d) demographics only
+  # We'll call the y variable 'y' because then we can reuse the model wtihout having to recompile it for each variable
+  formula.clin_otherClin_demogr = paste0('y~',paste(clin.fs,collapse='+'),'+',paste(demogr,collapse='+'))
+  formula.clin_demogr = paste0('y~',paste(unique(c(iq,demogr)),collapse='+'))
+  if (!(iq %in% demogr)){
+    formula.clin_otherClin_demogr.ctrlNoClin = paste0('y~',paste(setdiff(clin.fs,iq),collapse='+'),'+',paste(demogr,collapse='+'))
+    formula.clin_demogr.ctrlNoClin = paste0('y~',paste(demogr,collapse='+'))
+  } else{
+    formula.clin_otherClin_demogr.ctrlNoClin = paste0('y~',paste(setdiff(clin.fs,iq),collapse='+'),'+',paste(setdiff(demogr,iq),collapse='+'))
+    formula.clin_demogr.ctrlNoClin = paste0('y~',paste(setdiff(demogr,iq),collapse='+'))
+  }
+  
+  # loop over each behaviour
+  models=list()
+  models.done=F
+  for (ibehav in behavs){
+
+    # check correlation
+    if (iq!='Gender.numeric'){
+      this.test.parametric = cor.test(df.full[[ibehav]],df.full[[iq]])
+      this.test.nonparametric = cor.test(df.full[[ibehav]],df.full[[iq]],method='spearman')
+    } else{
+      this.test.parametric = t.test(df.full%>% dplyr::filter(Gender.numeric=='Male') %>% pull(ibehav),df.full%>% dplyr::filter(Gender.numeric=='Female') %>% pull(ibehav))
+      this.test.nonparametric = wilcox.test(df.full%>% dplyr::filter(Gender.numeric=='Male') %>% pull(ibehav),df.full%>% dplyr::filter(Gender.numeric=='Female') %>% pull(ibehav))
+    }
+    if (this.test.parametric$p.value < 0.05 | this.test.nonparametric$p.value<0.05){
+      # check if already run
+      this.file = file.path(this.folder,paste0(iq,'_',ibehav,'.RData'))
+      if (!file.exists(this.file)){
+        # to save time: create the models when we're doing the first variable
+        if (models.done==F){
+          # Run the models
+          models=list()
+          models$clin_otherClin_demogr            = brm(formula=formula.clin_otherClin_demogr,data=df.full%>% dplyr::mutate(y=DEBRIEF.Q29),
+                                                        chains=4,iter=1,prior=my.prior,silent=2,refresh=0,save_pars = save_pars(all = TRUE)) # save_pars is to be able to compute BFs
+          models$clin_demogr                      = brm(formula=formula.clin_demogr,data=df.full%>% dplyr::mutate(y=DEBRIEF.Q29),
+                                                        chains=4,iter=1,prior=my.prior,silent=2,refresh=0,save_pars = save_pars(all = TRUE)) 
+          models$clin_otherClin_demogr.ctrlNoClin = brm(formula=formula.clin_otherClin_demogr.ctrlNoClin,data=df.full%>% dplyr::mutate(y=DEBRIEF.Q29),
+                                                        chains=4,iter=1,prior=my.prior,silent=2,refresh=0,save_pars = save_pars(all = TRUE)) 
+          models$clin_demogr.ctrlNoClin           = brm(formula=formula.clin_demogr.ctrlNoClin,data=df.full%>% dplyr::mutate(y=DEBRIEF.Q29),
+                                                        chains=4,iter=1,prior=my.prior,silent=2,refresh=0,save_pars = save_pars(all = TRUE)) 
+          models.done=T
+        }
+        print(paste('running',iq,ibehav))
+        df =df.full %>% dplyr::select(all_of(c(ibehav,q.factors))) %>% dplyr::rename(y=!!{ibehav}) %>% na.omit() # pull data frame
+        
+        # run each of the 4 models
+        new.models=list()
+        fixefs = list()
+        for (imodel in names(models)){
+          new.models[[imodel]] = update(models[[imodel]],newdata=df,iter=20000)
+          fixefs[[imodel]] = as.data.frame(fixef(new.models[[imodel]])) %>% tibble::rownames_to_column()
+        }
+        # compute 2 Bayes factors
+        bf.clin_otherClin_demogr  = bayes_factor(new.models$clin_otherClin_demogr,new.models$clin_otherClin_demogr.ctrlNoClin)
+        bf.clin_demogr            = bayes_factor(new.models$clin_demogr   ,       new.models$clin_demogr.ctrlNoClin)
+        # save the fixefs and the BFs - or load the temp file
+        out=list()
+        out$fixefs=fixefs
+        out$bf.clin_otherClin_demogr= bf.clin_otherClin_demogr
+        out$bf.clin_demogr = bf.clin_demogr
+        out$cor.param=this.test.parametric
+        out$cor.nonparam= this.test.nonparametric
+        save(out,file=this.file)
+      } else{
+        print(paste('loading',iq,ibehav))
+        load(this.file)# out
+      }
+      res.ctrOtherClin=out$fixefs$clin_otherClin_demogr %>% dplyr::filter(stringr::str_detect(rowname,iq))
+      res.clin_demogr=out$fixefs$clin_demogr %>% dplyr::filter(stringr::str_detect(rowname,iq))
+      resT = data.frame(Clin.factor = iq, task.measure=ibehav, 
+                        bf.clin_otherClin_demogr=out$bf.clin_otherClin_demogr$bf,
+                        bf.clin_demogr = out$bf.clin_demogr$bf,
+                        ctrOtherClin.estimate = res.ctrOtherClin$Estimate,
+                        ctrDemogr.estimate = res.clin_demogr$Estimate,
+                        ctrOtherClin.Q2.5 = res.ctrOtherClin$Q2.5,
+                        ctrOtherClin.Q97.5 = res.ctrOtherClin$Q97.5)
+      # bind the results
+      results=bind_rows(results,resT)
+      if (stringr::str_detect(ibehav,'DEBRIEF')){
+        #browser()
+      }
+      rm(out)
+    }
+  }
+}
+
+write.csv(results,file.path(paths$stats,'Revision2_MachineLearning_BayesFactors_individualPredictors.csv'))
+```
+
+
+To consider:
+- leave out self-reports to shorten the table
+- collapse across bayes factors
+```{r}
+results=read.csv(file.path(paths$stats,'Revision2_MachineLearning_BayesFactors_individualPredictors.csv')) %>% dplyr::select(-X)
+lables=read.xlsx(file.path(paths$discovery,'Code','Behav_measures_NewLabels_12Oct2022.xlsx')) # join more understandable labels
+# need to define the group level effects, for this need to look at non-zscored data
+means = rbind(data.replication %>% dplyr::select(-contains('rewardSum'),-contains('fitted.ok.flag')),data.discovery %>% dplyr::select(-contains('fitted.ok.flag'))) %>%
+  dplyr::ungroup() %>% dplyr::summarize_all(mean,na.rm=T)# need to define the group level effects, for this need to look at non-zscored data
+medians = rbind(data.replication %>% dplyr::select(-contains('rewardSum'),-contains('fitted.ok.flag')),data.discovery %>% dplyr::select(-contains('fitted.ok.flag'))) %>%
+  dplyr::ungroup() %>% dplyr::summarize_all(median,na.rm=T)# need to define the group level effects, for this need to look at non-zscored data
+means_medians= rbind(means,medians) %>% dplyr::mutate(type=c('mean','median')) %>% pivot_longer(cols=-type) %>% pivot_wider(.,id_cols=name,values_from=value,names_from=type)
+
+# extract from regressions of clin ~ task features what was significant and append
+# regresions: debrief only, mood only, task only (not comp), comp only 
+types=c('debrief','compoundTask_noMood','indivChoiceModel','mood_related')
+res.ML =data.frame()
+for (iclin in unique(results$Clin.factor)){
+  for (itype in types){
+    load(file.path(paths$replication,'Data','Preprocessed','MachineLearning','BRMSmodels','TrainedReplication_predictClinFactors_rawTaskMeasures_zscored',
+                   paste0('BRM_',iclin,'_Bartlett_TrainWithoutOtherClin_',itype,'.RData')))#model
+    t=as.data.frame(fixef(model)) %>% tibble::rownames_to_column() %>%   dplyr::filter(sign(Q2.5)==sign(Q97.5))  %>%
+      dplyr::mutate(demogr=iclin,type=itype)
+    if (length(t)>0){
+      res.ML=rbind(res.ML,t)
+    }
+  }
+
+}
+res.ML = res.ML %>% dplyr::rename(Q2.5.ML = Q2.5, Q97.5.ML=Q97.5)
+
+results.comb=results %>% dplyr::filter((bf.clin_otherClin_demogr>=3 | bf.clin_demogr >=3) & (sign(ctrOtherClin.estimate)==sign(ctrDemogr.estimate))) %>%
+  left_join(.,means_medians,by=c('task.measure'='name')) %>% dplyr::select(-median) %>% 
+  full_join(.,res.ML %>% dplyr::select(Q2.5.ML,Q97.5.ML,rowname,demogr,type),by=c('Clin.factor'='demogr','task.measure'='rowname')) %>%
+  left_join(.,lables %>% dplyr::select(Varname,Shortest_title),by=c('task.measure'='Varname')) %>% dplyr::rename(demogr=Clin.factor,measure=task.measure)  %>%
+  dplyr::mutate(mean = case_when(stringr::str_detect(measure,'original')|stringr::str_detect(measure,'original') ~ NA,T ~ mean))  %>%
+  #dplyr::filter(!stringr::str_detect(measure,'DEBRIEF')) %>%
+  dplyr::mutate(gr.sign = case_when(mean>0 ~ '+',
+                                          mean<0 ~ '-'),
+                      demogr.sign = case_when(ctrOtherClin.estimate >0 ~ '+',
+                                              ctrOtherClin.estimate<0 ~ '-'),
+                      label=case_when(!is.na(mean) ~  paste0(Shortest_title,'[gr',gr.sign,',',demogr.sign,']'),
+                                      T ~ paste0(Shortest_title,'[',demogr.sign,']')))
+# note, there are no cases where the signs don't agree for the estimates and no cases where the signs for means and median don't agree
+
+
+# columns: everything, control clin,  control demogr NOT clin, ML not control clin And not control demogr, control demogr, ML,  
+results.summary = data.frame()
+for (idemogr in unique(results.comb$demogr)){
+  t.ctrOtherClin=results.comb %>% dplyr::filter(demogr==idemogr & bf.clin_otherClin_demogr > 3)
+  t.ctrDemogrOnly=results.comb %>% dplyr::filter(demogr==idemogr & bf.clin_demogr > 3)
+  t.ML = results.comb %>% dplyr::filter(demogr==idemogr & !is.na(Q2.5.ML))
+  t.all = rbind(t.ctrOtherClin,t.ctrDemogrOnly, t.ML) %>% distinct()
+  add.ctrDemogrOnly = anti_join(t.ctrDemogrOnly,t.ctrOtherClin)
+  add.ML = anti_join(t.ML,rbind(t.ctrDemogrOnly,t.ctrOtherClin))
+  t= data.frame(demogr=idemogr,
+                all = paste(t.all %>% pull(label),collapse=','),
+                ctrOtherClin= paste(t.ctrOtherClin %>% pull(label),collapse=','),
+                add.ctrDemogrOnly = paste(add.ctrDemogrOnly %>% pull(label),collapse=','),
+                add.ML = paste(add.ML %>% pull(label),collapse=','),
+                ctrDemogrOnly = paste(t.ctrDemogrOnly %>% pull(label),collapse=','),
+                ML =paste(t.ML %>% pull(label),collapse=','))
+  results.summary=rbind(results.summary,t)
+                
+}
+write.csv(results.summary,file=file.path(paths$stats,'Revision2_MachineLearning_BayesFactors_individualPredictors_summary.csv'))
+
+```
+
+
+
+## Illustrate-Anhedonia
+We find that anhedonia might increase reward sensitivity. Therefore as illustration: bar graphs with top and bottom 10% anhedonia factor (across both samples). On x-axis 4 (6?) reward bins, on y axis the behaviour, two colours: the two groups. Unfortunately, the results look different than during the last revision. This could be because the factor scores now have a changed meaning. To be as thorough as possible, we should show for the replies the fullest possible picture:
+- do everything bottom/top 10%, but also 20%
+- split by shaps scores
+- split by Anhedonia factor
+- split by Anhedonia factor residuals
+
+
+Not done yet: residualize behaviour (removing threat etc)
+Not done yet: hierarchical model % forage ~ reward * Anhedonia + threat+... to then see the anhedonia posterior plot
+OR % forage ~ reward * (Anhedonia+ ALL FACTORS + DEMOGRAPHICS) + threat+... Let's do this only on the replication sample
+
+
+```{r}
+# we need to read the raw behaviour
+load(file.path(paths$replication,'Data','Preprocessed','BehaviouralMeasures_SlightlyReduced.RData'))
+raw.replication=slightly.reduced.behav.measures
+rm(slightly.reduced.behav.measures)
+load(file.path(paths$discovery,'Data','Preprocessed','BehaviouralMeasures_SlightlyReduced.RData'))
+raw.discovery  = slightly.reduced.behav.measures
+rm(slightly.reduced.behav.measures)
+
+load(file.path(paths$replication,'Data','Preprocessed','FactorAnalysis','Questionnaires','Troubleshooting',
+               paste0('FactorScores__data_replication__FA_replication__allMethods_zscored.RData'))) 
+all.factorScores.replication=all.factorScores
+rm(all.factorScores)
+load(file.path(paths$replication,'Data','Preprocessed','FactorAnalysis','Questionnaires','Troubleshooting',
+               paste0('FactorScores__data_discovery__FA_replication__allMethods_zscored.RData')))
+all.factorScores.discovery=all.factorScores
+
+clin=c(colnames(all.factorScores.replication$Bartlett %>% dplyr::select(-ID)),'Age','Gender.numeric','Education.numeric')
+dft1 = left_join(raw.replication%>% dplyr::select(-contains('rewardSum')),
+                 data.replication.psych %>% dplyr::select(Age,Gender.numeric,Education.numeric,ID,shaps,intolUncert_ProspectAnx) ,by='ID') %>%
+  left_join(.,all.factorScores.replication$Bartlett,by='ID') %>%
+  dplyr::mutate(newID=ID,sample='replication')
+dft2= left_join(raw.discovery,
+                data.discovery.psych%>% dplyr::select(Age,Gender.numeric,Education.numeric,ID,shaps,intolUncert_ProspectAnx) ,by='ID') %>%
+      left_join(.,all.factorScores.discovery$Bartlett,by='ID') %>% dplyr::mutate(newID=ID+max(dft1$ID),sample='discovery')
+df.raw.disc.repl= rbind(dft1,dft2) %>%
+  dplyr::select(all_of(clin),shaps,intolUncert_ProspectAnx,reward.start,fullEpoch.perc.hide,fullEpoch.perc.forage, newID,sample,delay,envIndex, speed, noOfCones,predIndex) %>% na.omit() #hiding.secPredatorUntilPredArrival,preDiscovery.firstStopHidingAction.time,
+
+#[1] binning 
+# Problem: anhedonia and apathy are correlated. So need to first create those residuals
+df.forRegression = df.raw.disc.repl %>% dplyr::select(newID,all_of(clin)) %>%dplyr::group_by(newID) %>% dplyr::summarize_all(unique)
+fit = lm(Anhedonia ~ 1+IntolUncert + Decentering+Apathy.behav+Apathy.emot+Compul.checking+Age+Gender.numeric+Education.numeric,data=df.forRegression)
+df.forRegression$Anhedonia.residuals = fit$residuals
+df = left_join(df.raw.disc.repl,df.forRegression %>% dplyr::select(newID,Anhedonia.residuals),by='newID') 
+quant.reward=quantile(df$reward.start,probs=c(0,0.25,0.5,0.75,1))
+df= df %>%
+  dplyr::mutate(reward = case_when(reward.start <= 23 ~ 'Very low',
+                                   reward.start <=45  ~ 'Low',
+                                   reward.start <=64  ~ 'High', #<=
+                                   TRUE ~ 'Very high'))  %>%
+  dplyr::mutate(reward=factor(reward,ordered=T,levels=c('Very low','Low','High','Very high'))) 
+
+all.plots=list()
+plots=list()
+this.font=25#18
+font.pval=6
+for (isample in c('discovery','replication','both')){
+  if (isample=='both'){
+    df.plotT=df
+  } else{
+    df.plotT = df %>% dplyr::filter(sample == isample)
+  }
+for (iperc in c(0.1,0.2)){
+  plotst=list()
+  for (idata in c('shaps','Anhedonia','Anhedonia.residuals')){
+    quant.anhedonia = quantile(df.plotT[[idata]],probs=c(iperc,1-iperc))
+    df.plot=  df.plotT %>% dplyr::filter((!!sym(idata)  <= quant.anhedonia[1]) | (!!sym(idata)  >= quant.anhedonia[2])) %>% 
+      dplyr::group_by(newID,reward)%>%
+      dplyr::summarize_all(mean,na.rm=T) %>%
+      dplyr::ungroup() %>%
+      dplyr::mutate(Anhedonia.gr=case_when(!!sym(idata)<=quant.anhedonia[1] ~ 'Low ',
+                                           TRUE ~ 'High')) %>%
+      dplyr::select(newID,Anhedonia.gr, reward, fullEpoch.perc.hide,fullEpoch.perc.forage) 
+  
+    plots.forage = ggerrorplot(df.plot,x='reward',y='fullEpoch.perc.forage',add='jitter',add.params=list(color='Anhedonia.gr',size=0.1),color='Anhedonia.gr',
+                               ylab='% Forage',xlab='Reward',desc_stat = "mean_se",title=paste('s:',isample,'perc:', iperc,'select:', idata),size=0.2,legend='right',legend.title='Anhedonia')+
+      stat_compare_means(aes(group = Anhedonia.gr,label = sprintf("p = %.2f", as.numeric(..p.format..))),label.y=0.8,size=font.pval)
+    plots.forage= ggpar(plots.forage, ylim=c(0.1,0.85)) +font('title',size=8) +  font('xlab',size=this.font) + font('ylab',size=this.font) + 
+      font('caption',size=this.font)+ font("xy.text", size = (this.font-2)) + font('legend.title',size=this.font)+font('legend.text',size=(this.font-2))
+
+
+    plots.hide = ggerrorplot(df.plot,x='reward',y='fullEpoch.perc.hide',add='jitter',add.params=list(color='Anhedonia.gr',size=0.05),color='Anhedonia.gr',
+                             ylab='%Hide',xlab='Reward', desc_stat = "mean_se",title=paste('s:',isample,'perc:', iperc,'select:', idata),size=0.12,legend='right',legend.title='Anhedonia')+ 
+      stat_compare_means(aes(group = Anhedonia.gr,label = sprintf("p = %.2f", as.numeric(..p.format..))),label.y=0.8,size=font.pval) 
+    plots.hide= ggpar(plots.hide, ylim=c(0.1,0.85)) +font('title',size=8) +  font('xlab',size=this.font) + font('ylab',size=this.font) + 
+      font('caption',size=this.font) +  font("xy.text", size = (this.font-2)) +  font('legend.title',size=this.font)+font('legend.text',size=(this.font-2))
+    plotst[[idata]] = ggarrange(plots.forage,plots.hide,nrow=1,ncol=2)
+    
+    all.plots[[paste0('forage_perc.',iperc,'_data.',idata,'_sample.',isample)]] = plots.forage
+    all.plots[[paste0('hide_perc.',iperc,'_data.',idata,'_sample.',isample)]] = plots.hide
+  }
+  plots[[paste0('sample.',isample,'_perc.',iperc)]] = ggarrange(plotst$shaps,plotst$Anhedonia,plotst$Anhedonia.residuals,nrow=3,ncol=1)
+}
+}
+    
+  
+ggexport(plotlist=plots,filename=file.path(paths$figures,'Revision2_MachineLearning_AnhedoniaIllustration.pdf')) #, width=10*400,height=4*400,res=400)
+
+
+# illustration for the paper
+plots.suppl=ggarrange(all.plots$forage_perc.0.2_data.shaps_sample.discovery ,   all.plots$hide_perc.0.2_data.shaps_sample.discovery,
+                      all.plots$forage_perc.0.2_data.shaps_sample.replication, all.plots$hide_perc.0.2_data.shaps_sample.replication, 
+                      nrow=2,ncol=2)
+ggexport(plots.suppl,filename=file.path(paths$figures,'Revision2_MachineLearning_AnhedoniaIllustration_supplements.jpg'), width=18.5*400,height=8*400,res=400)
+
+plots.suppl.newTitle=ggarrange(all.plots$forage_perc.0.2_data.shaps_sample.discovery+ggtitle('')+rremove('legend') ,   all.plots$hide_perc.0.2_data.shaps_sample.discovery+ggtitle(''),
+                      all.plots$forage_perc.0.2_data.shaps_sample.replication+ggtitle('')+rremove('legend'), all.plots$hide_perc.0.2_data.shaps_sample.replication+ggtitle(''), 
+                      nrow=2,ncol=2,labels=c('Ai Discovery sample','Aii Discovery sample','Bi Replication sample','Bii Replication sample'),font.label = list(size = 18),hjust=0)
+ggexport(plots.suppl.newTitle,filename=file.path(paths$figures,'Revision2_MachineLearning_AnhedoniaIllustration_extendedDataFigure.tiff'), width=18.5*400,height=7*400,res=400)
+ggexport(plots.suppl.newTitle,filename=file.path(paths$figures,'Paper_ExtendedFigure4.pdf'), width=18,height=7)
+
+
+plots.replies=ggarrange(all.plots$forage_perc.0.2_data.Anhedonia_sample.discovery,   all.plots$hide_perc.0.2_data.Anhedonia_sample.discovery,
+                      all.plots$forage_perc.0.2_data.Anhedonia_sample.replication,   all.plots$hide_perc.0.2_data.Anhedonia_sample.replication, nrow=2,ncol=2)
+ggexport(plots.replies,filename=file.path(paths$figures,'Revision2_MachineLearning_AnhedoniaIllustration_replies.jpg'), width=8*400,height=6*400,res=400)
+
+```
+
+Regression
+the equation used for individual participatns for % forage is: y ~ mo(speed) + mo(noOfCones) + reward.start + delay + envIndex + first.predator.YesNo 
+
+```{r}
+# assumes df.raw.disc.repl created above
+df=df.raw.disc.repl %>% 
+  dplyr::mutate(first.predator.YesNo = case_when(predIndex==1 ~ 1,
+                                                 T ~ 0),
+                speed = factor(speed,levels=c(20,15,10),ordered=T),
+                noOfCones = factor(noOfCones,levels=c(1,2,3,4),ordered=T)) %>% 
+  dplyr::mutate_at(.vars=c(clin,'reward.start','delay','envIndex','first.predator.YesNo'),scale)
+
+my.prior=c(prior(normal(0,1),class='b'),
+           prior(normal(0.5,1),class='Intercept')) # middle of percentage is 50%
+
+this.path=file.path(paths$replication,'Data','Preprocessed','Revision2','AnhedoniaModels')
+
+this.file = file.path(this.path,'FullEpochForage_anhedoniaOnly.RData')
+if (!file.exists(this.file)){
+model.percforage.anhedoniaOnly = brm(bf(fullEpoch.perc.forage ~ mo(speed) + mo(noOfCones) + reward.start*Anhedonia + delay + envIndex + first.predator.YesNo+
+                         (mo(speed) + mo(noOfCones) + reward.start + delay + envIndex + first.predator.YesNo|newID),
+                         sigma~1+(1|newID)),iter=4000,data=df,prior=my.prior )
+save(model.percforage.anhedoniaOnly,file=this.file)
+} else{ load(this.file)}
+sink(file=paste0(stringr::str_remove(this.file,'.RData'),'.txt')) 
+summary(model.percforage.anhedoniaOnly)
+sink()
+
+
+this.file = file.path(this.path,'FullEpochForage_anhedonia_DemogrOnly.RData')
+if (!file.exists(this.file)){
+model.percforage.anhedonia_demogr = brm(bf(fullEpoch.perc.forage ~ mo(speed) + mo(noOfCones) + 
+                                             reward.start*(Anhedonia+Gender.numeric+Age+Education.numeric) + delay + envIndex + first.predator.YesNo+
+                         (mo(speed) + mo(noOfCones) + reward.start + delay + envIndex + first.predator.YesNo|newID),
+                         sigma~1+(1|newID)),iter=4000,data=df,prior=my.prior )
+save(model.percforage.anhedonia_demogr,file=this.file)
+} else{ load(this.file) }
+sink(file=paste0(stringr::str_remove(this.file,'.RData'),'.txt')) 
+summary(model.percforage.anhedonia_demogr)
+sink()
+
+
+this.file = file.path(this.path,'FullEpochForage_fullClin.RData')
+clins.txt=paste(clin,collapse='+')
+if (!file.exists(this.file)){
+model.percforage.fullClin = brm(bf(fullEpoch.perc.forage ~ mo(speed) + mo(noOfCones) + 
+                                     reward.start*(Anxiety+Anhedonia+IntolUncert+Decentering+Apathy.behav+Apathy.emot+Compul.checking+Age+Gender.numeric+Education.numeric) + 
+                                             delay + envIndex + first.predator.YesNo+
+                         (mo(speed) + mo(noOfCones) + reward.start + delay + envIndex + first.predator.YesNo|newID),
+                         sigma~1+(1|newID)),iter=4000,data=df,prior=my.prior )
+save(model.percforage.fullClin,file=this.file)
+} else{load(this.file)}
+
+sink(file=paste0(stringr::str_remove(this.file,'.RData'),'.txt')) 
+summary(model.percforage.fullClin)
+sink()
+
+this.file = file.path(this.path,'FullEpochForage_noIndivDiff.RData')
+if (!file.exists(this.file)){
+model.percforage.noClin = brm(bf(fullEpoch.perc.forage ~ mo(speed) + mo(noOfCones) + reward.start + delay + envIndex + first.predator.YesNo+
+                         (mo(speed) + mo(noOfCones) + reward.start + delay + envIndex + first.predator.YesNo|newID),
+                         sigma~1+(1|newID)),iter=4000,data=df,prior=my.prior )
+save(model.percforage.noClin,file=this.file)
+} else{load(this.file)}
+sink(file=paste0(stringr::str_remove(this.file,'.RData'),'.txt')) 
+summary(model.percforage.noClin)
+sink()
+
+```
+
+Make a plot. Print results are (with many digits): I think the numbers look very small because of the scaling, but the important thing is the significance.
+ Family: gaussian 
+  Links: mu = identity; sigma = log 
+Formula: fullEpoch.perc.forage ~ mo(speed) + mo(noOfCones) + reward.start * (Anxiety + Anhedonia + IntolUncert + Decentering + Apathy.behav + Apathy.emot + Compul.checking + Age + Gender.numeric + Education.numeric) + delay + envIndex + first.predator.YesNo + (mo(speed) + mo(noOfCones) + reward.start + delay + envIndex + first.predator.YesNo | newID) 
+         sigma ~ 1 + (1 | newID)
+   Data: df (Number of observations: 67351) 
+  Draws: 4 chains, each with iter = 4000; warmup = 2000; thin = 1;
+         total post-warmup draws = 8000
+
+Group-Level Effects: 
+~newID (Number of levels: 1069) 
+                                       Estimate Est.Error l-95% CI u-95% CI    Rhat Bulk_ESS Tail_ESS
+sd(Intercept)                           0.08018   0.00185  0.07659  0.08385 1.00497     1547     2993
+sd(reward.start)                        0.00899   0.00037  0.00827  0.00973 1.00004     4628     5920
+sd(delay)                               0.00892   0.00040  0.00814  0.00970 1.00046     3951     6046
+sd(envIndex)                            0.01906   0.00051  0.01808  0.02010 1.00063     2809     4743
+sd(first.predator.YesNo)                0.00995   0.00037  0.00923  0.01068 1.00009     4040     6044
+sd(mospeed)                             0.02227   0.00060  0.02110  0.02344 1.00104     2869     5129
+sd(monoOfCones)                         0.01069   0.00036  0.01001  0.01143 1.00051     4187     5645
+sd(sigma_Intercept)                     0.16748   0.00485  0.15803  0.17720 1.00051     2880     5565
+cor(Intercept,reward.start)             0.02053   0.04320 -0.06376  0.10525 1.00024     6201     6632
+cor(Intercept,delay)                   -0.29463   0.04302 -0.37695 -0.20910 1.00118     4442     6056
+cor(reward.start,delay)                 0.08832   0.05795 -0.02510  0.20262 1.00152     2664     4642
+cor(Intercept,envIndex)                 0.03683   0.03523 -0.03306  0.10519 1.00189     2186     4105
+cor(reward.start,envIndex)             -0.15575   0.04668 -0.24763 -0.06572 1.00135      903     1817
+cor(delay,envIndex)                    -0.11781   0.04729 -0.20926 -0.02399 1.00778      814     1627
+cor(Intercept,first.predator.YesNo)     0.19446   0.04040  0.11467  0.27305 1.00020     4399     5757
+cor(reward.start,first.predator.YesNo)  0.04423   0.05568 -0.06288  0.15379 1.00076     1995     3951
+cor(delay,first.predator.YesNo)         0.04394   0.05352 -0.05827  0.14905 1.00150     2100     4454
+cor(envIndex,first.predator.YesNo)     -0.19861   0.04321 -0.28321 -0.11251 1.00002     4986     5660
+cor(Intercept,mospeed)                 -0.32921   0.03118 -0.38997 -0.26699 1.00099     3058     4806
+cor(reward.start,mospeed)              -0.22033   0.04503 -0.30802 -0.13142 1.00178     1470     3279
+cor(delay,mospeed)                     -0.22185   0.04427 -0.30906 -0.13351 1.00438     1687     2953
+cor(envIndex,mospeed)                  -0.00750   0.03793 -0.08084  0.06822 1.00181     2620     4046
+cor(first.predator.YesNo,mospeed)       0.03500   0.04428 -0.04841  0.12327 1.00042     1929     4006
+cor(Intercept,monoOfCones)             -0.06610   0.03882 -0.14253  0.01147 1.00030     4282     6075
+cor(reward.start,monoOfCones)          -0.24898   0.04900 -0.34293 -0.15110 1.00121     2249     4323
+cor(delay,monoOfCones)                 -0.36687   0.04813 -0.45742 -0.26964 1.00133     2133     3844
+cor(envIndex,monoOfCones)              -0.05526   0.04189 -0.13627  0.02573 1.00061     3501     5252
+cor(first.predator.YesNo,monoOfCones)   0.11738   0.04926  0.01914  0.21342 1.00040     3374     4627
+cor(mospeed,monoOfCones)                0.35676   0.03698  0.28285  0.42895 1.00044     3831     5721
+
+Population-Level Effects: 
+                               Estimate Est.Error l-95% CI u-95% CI    Rhat Bulk_ESS Tail_ESS
+Intercept                       0.57873   0.00258  0.57353  0.58362 1.00686      760     1582
+sigma_Intercept                -2.76701   0.00590 -2.77844 -2.75535 0.99986     4100     5446
+reward.start                    0.00641   0.00038  0.00567  0.00716 1.00081     8905     7036
+Anxiety                        -0.00492   0.00261 -0.00991  0.00029 1.00163     1008     2016
+Anhedonia                       0.00353   0.00260 -0.00154  0.00870 1.00380      843     1737
+IntolUncert                     0.00165   0.00266 -0.00345  0.00678 1.00518      936     2114
+Decentering                    -0.00078   0.00282 -0.00627  0.00494 1.00150     1046     1869
+Apathy.behav                    0.00452   0.00249 -0.00043  0.00940 1.00157     1196     2335
+Apathy.emot                     0.00552   0.00239  0.00087  0.01017 1.00717      930     2026
+Compul.checking                -0.00671   0.00240 -0.01140 -0.00204 1.00382     1024     2022
+Age                            -0.01672   0.00227 -0.02111 -0.01227 1.00315     1088     2213
+Gender.numeric                 -0.01789   0.00244 -0.02265 -0.01288 1.00450      869     1795
+Education.numeric               0.00110   0.00229 -0.00337  0.00561 1.00662      960     1920
+delay                           0.01448   0.00038  0.01374  0.01523 1.00052     5761     5963
+envIndex                        0.02343   0.00067  0.02211  0.02471 1.00072     3652     5705
+first.predator.YesNo           -0.00235   0.00039 -0.00312 -0.00160 1.00014     7196     6265
+reward.start:Anxiety            0.00015   0.00043 -0.00070  0.00101 1.00050     8328     6190
+reward.start:Anhedonia          0.00100   0.00043  0.00016  0.00185 0.99996     8275     7265
+reward.start:IntolUncert       -0.00147   0.00043 -0.00232 -0.00060 1.00053     8279     7156
+reward.start:Decentering       -0.00007   0.00046 -0.00098  0.00083 0.99974     7128     6301
+reward.start:Apathy.behav       0.00050   0.00042 -0.00033  0.00132 0.99986     8059     7179
+reward.start:Apathy.emot       -0.00015   0.00040 -0.00092  0.00064 1.00070     7310     6962
+reward.start:Compul.checking    0.00011   0.00040 -0.00068  0.00090 0.99995     8246     7324
+reward.start:Age               -0.00103   0.00038 -0.00179 -0.00030 1.00050     7069     6670
+reward.start:Gender.numeric    -0.00187   0.00040 -0.00266 -0.00109 1.00042     6938     6494
+reward.start:Education.numeric -0.00061   0.00037 -0.00135  0.00011 1.00038     8472     6756
+mospeed                        -0.03805   0.00076 -0.03952 -0.03658 1.00049     3519     5402
+monoOfCones                    -0.02865   0.00042 -0.02945 -0.02781 1.00030     8793     7134
+
+Simplex Parameters: 
+                Estimate Est.Error l-95% CI u-95% CI    Rhat Bulk_ESS Tail_ESS
+mospeed1[1]      0.39603   0.00671  0.38266  0.40936 1.00073    12583     7068
+mospeed1[2]      0.60397   0.00671  0.59064  0.61734 1.00073    12583     7068
+monoOfCones1[1]  0.51257   0.00855  0.49592  0.52906 1.00019    13505     7042
+monoOfCones1[2]  0.30729   0.00869  0.29008  0.32470 0.99992    13549     7257
+monoOfCones1[3]  0.18015   0.00887  0.16247  0.19733 1.00021    13793     7002
+
+Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+and Tail_ESS are effective sample size measures, and Rhat is the potential
+scale reduction factor on split chains (at convergence, Rhat = 1).
+```{r}
+load(file.path(paths$replication,'Data','Preprocessed','Revision2','AnhedoniaModels','FullEpochForage_fullClin.RData'))# model.percforage.fullClin
+p=conditional_effects(model.percforage.fullClin,'reward.start:Anhedonia')
+p=plot(p,
+       points = F, #point_args=list(width=0.2,size=1),
+       plot = F)[[1]]+theme_bw()
+print(model.percforage.fullClin,digits=5)
+ggexport(p,filename = file.path(paths$figures,'Revision2_MachineLearning_AnhedoniaIllustration_DiscReplComb_ConditionalEffecctsPlot.jpg'),width=6*400,height=3*400,res=400)
+```
+
+
+## Illustrate - uncertainty
+In table 3, we report decrease of the reward*% forage interaction term, so let's plot it like above for anhedonia
+
+```{r}
+
+# created above for anhedonia - not changed here in case we make any code changes above, we can be sure to use twice exactly the same:
+#df.raw.disc.repl= 
+
+#[1] binning 
+df = df.raw.disc.repl
+quant.reward=quantile(df$reward.start,probs=c(0,0.25,0.5,0.75,1))
+df= df %>%
+  dplyr::mutate(reward = case_when(reward.start <= 23 ~ 'Very low',
+                                   reward.start <=45  ~ 'Low',
+                                   reward.start <=64  ~ 'High', #<=
+                                   TRUE ~ 'Very high'))  %>%
+  dplyr::mutate(reward=factor(reward,ordered=T,levels=c('Very low','Low','High','Very high'))) 
+
+all.plots=list()
+plots=list()
+this.font=18
+for (isample in c('discovery','replication','both')){
+  if (isample=='both'){
+    df.plotT=df
+  } else{
+    df.plotT = df %>% dplyr::filter(sample == isample)
+  }
+for (iperc in c(0.1,0.2)){
+  plotst=list()
+  for (idata in c('intolUncert_ProspectAnx','IntolUncert')){
+    quant.anhedonia = quantile(df.plotT[[idata]],probs=c(iperc,1-iperc))
+    df.plot=  df.plotT %>% dplyr::filter((!!sym(idata)  <= quant.anhedonia[1]) | (!!sym(idata)  >= quant.anhedonia[2])) %>% 
+      dplyr::group_by(newID,reward)%>%
+      dplyr::summarize_all(mean,na.rm=T) %>%
+      dplyr::ungroup() %>%
+      dplyr::mutate(IntolUncert.gr=case_when(!!sym(idata)<=quant.anhedonia[1] ~ 'Low ',
+                                           TRUE ~ 'High')) %>%
+      dplyr::select(newID,IntolUncert.gr, reward, fullEpoch.perc.hide,fullEpoch.perc.forage) 
+  
+    plots.forage = ggerrorplot(df.plot,x='reward',y='fullEpoch.perc.forage',color='IntolUncert.gr',desc_stat = "mean_se",title=paste('s:',isample,'perc:', iperc,'select:', idata),size=0.05)+ 
+      stat_compare_means(aes(group = IntolUncert.gr,label = sprintf("p = %.2f", as.numeric(..p.format..))),label.y=0.4) 
+    plots.forage= ggpar(plots.forage, ylim=c(0.25,0.52)) +font('title',size=8) +  font('xlab',size=this.font) + font('ylab',size=this.font) + font('caption',size=this.font) 
+    plots.hide = ggerrorplot(df.plot,x='reward',y='fullEpoch.perc.hide',color='IntolUncert.gr',desc_stat = "mean_se",title=paste('s:',isample,'perc:', iperc,'select:', idata),size=0.05)+ 
+      stat_compare_means(aes(group = IntolUncert.gr,label = sprintf("p = %.2f", as.numeric(..p.format..))),label.y=0.4) 
+    
+    
+    plots.hide= ggpar(plots.hide, ylim=c(0.25,0.52)) +font('title',size=8) +  font('xlab',size=this.font) + font('ylab',size=this.font) + font('caption',size=this.font) 
+    plotst[[idata]] = ggarrange(plots.forage,plots.hide,nrow=1,ncol=2)
+    
+    all.plots[[paste0('forage_perc.',iperc,'_data.',idata,'_sample.',isample)]] = plots.forage
+    all.plots[[paste0('hide_perc.',iperc,'_data.',idata,'_sample.',isample)]] = plots.hide
+  }
+  plots[[paste0('sample.',isample,'_perc.',iperc)]] = ggarrange(plotst$intolUncert_ProspectAnx,plotst$IntolUncert,nrow=2,ncol=1)
+}
+}
+    
+  
+ggexport(plotlist=plots,filename=file.path(paths$figures,'Revision2_MachineLearning_IntolUncertIllustration.pdf')) #, width=10*400,height=4*400,res=400)
+
+
+# illustration for the paper
+# plots.suppl=ggarrange(all.plots$forage_perc.0.2_data.shaps_sample.discovery,   all.plots$hide_perc.0.2_data.shaps_sample.discovery,
+#                       all.plots$forage_perc.0.2_data.shaps_sample.replication,             all.plots$hide_perc.0.2_data.shaps_sample.replication, nrow=2,ncol=2)
+# ggexport(plots.suppl,filename=file.path(paths$figures,'Revision2_MachineLearning_AnhedoniaIllustration_supplements.jpg'), width=8*400,height=6*400,res=400)
+
+
+```
+
+
