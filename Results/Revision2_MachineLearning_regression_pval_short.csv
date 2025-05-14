@@ -1,0 +1,4 @@
+"","IntolUncert","Anhedonia","Anxiety","Decentering","Apathy.behav","Apathy.emot","Compul.checking","fa.method","initialTrainingType","task.data.type"
+"1",0.870678889314343,0.000351268671211451,0.286213024752647,0.0771270404470583,0.0218086029187067,0.176412912578256,0.0967652113560477,"Bartlett","TrainWithoutOtherClin","compoundTask_indivChoiceModel_noMood"
+"2",0.900282111648946,0.000452296790049877,0.388777377659775,0.0588249838501582,0.040999107450386,0.150201709699832,0.21984312125802,"nonweighted.sum","TrainWithoutOtherClin","compoundTask_indivChoiceModel_noMood"
+"3",0.910907442563635,0.00124954681171535,0.262264268490579,0.662097857487254,0.125081925575122,0.119658389131128,0.139349287737117,"Thurstone","TrainWithoutOtherClin","compoundTask_indivChoiceModel_noMood"
