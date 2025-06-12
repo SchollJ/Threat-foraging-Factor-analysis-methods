@@ -915,7 +915,7 @@ for (idata in data.types){
         # Create predictions
         df=df.discovery.imputed.split[[ifa]][[idata]] 
         df$ID= df.discovery.imputed.split[[ifa]]$ID
-        true=df %>% dplyr::select(all_of(q.factors),ID) %>% dplyr::rename_at(vars(-ID),~paste0(.,'_true'))
+        true=df %>% dplyr::select(all_of(q.factors),Gender.numeric,Age,Education.numeric,ID) %>% dplyr::rename_at(vars(-ID),~paste0(.,'_true'))
         df=df%>% na.omit()
         if (iq=='Gender.numeric'){
           df=df %>% dplyr::filter(Gender.numeric==min(Gender.numeric)| Gender.numeric==max(Gender.numeric)) %>%
@@ -943,7 +943,7 @@ for (idata in data.types){
         # Compare predictions to true with regression
         this.formula= paste0(iq,'~',paste(paste0(q.factors,'_true'),collapse='+'))
         out=lm(this.formula,data=df.withTrue)
-        
+        #browser()
         t=as.data.frame(summary(out)$coefficients) %>%tibble::rownames_to_column()
         summary.pval.regT = left_join(summary.pval.regT,t%>%dplyr::select(rowname,`Pr(>|t|)`) %>% dplyr::rename({{iq}}:=`Pr(>|t|)`), by=c('x'='rowname')  )
         summary.estimate.regT = left_join(summary.estimate.regT,t%>%dplyr::select(rowname,Estimate) %>% dplyr::rename({{iq}}:=Estimate), by=c('x'='rowname')  )
@@ -1138,12 +1138,19 @@ pt.regr=pt
 summary.table.regression= pt.regr %>% pivot_longer(.,cols=all_of(q.factors),names_to='Q.Factor',values_to='p.val') %>% 
   dplyr::filter( initialTrainingType=='TrainWithoutOtherClin'&zscoring=='zscored' & !stringr::str_detect(task.data.type,'TaskFactor_') & task.data.type=='compoundTask_indivChoiceModel_noMood')  %>%
   dplyr::select(fa.method,Q.Factor,p.val) %>%
-  pivot_wider(.,names_from='Q.Factor',values_from='p.val') %>% dplyr::select(-Gender.numeric,-Education.numeric,-Age)
+  dplyr::mutate(p.val=case_when(p.val<0.0001 ~ 'p<0.001',
+                              p.val<0.001 ~ 'p<0.001',
+                              p.val<0.01 ~ 'p<0.01',
+                             # p.val<0.05 ~ 'p<0.05',
+                              T ~ paste0('p=',round(p.val,2)))) %>%
+  pivot_wider(.,names_from='Q.Factor',values_from='p.val')
+write.csv(summary.table.regression,file=file.path(paths$results,'Regression_summary_pvals.csv'))
+#%>% dplyr::select(-Gender.numeric,-Education.numeric,-Age)
 
-summary.table.cor= pt.cor %>% pivot_longer(.,cols=all_of(q.factors),names_to='Q.Factor',values_to='p.val') %>% 
-  dplyr::filter( initialTrainingType=='TrainWithoutOtherClin'&  !stringr::str_detect(task.data.type,'TaskFactor_') & task.data.type=='compoundTask_indivChoiceModel_noMood')  %>%
-  dplyr::select(fa.method,Q.Factor,p.val) %>%
-  pivot_wider(.,names_from='Q.Factor',values_from='p.val') %>% dplyr::select(-Gender.numeric,-Education.numeric,-Age)
+# summary.table.cor= pt.cor %>% pivot_longer(.,cols=all_of(q.factors),names_to='Q.Factor',values_to='p.val') %>% 
+#   dplyr::filter( initialTrainingType=='TrainWithoutOtherClin'&  !stringr::str_detect(task.data.type,'TaskFactor_') & task.data.type=='compoundTask_indivChoiceModel_noMood')  %>%
+#   dplyr::select(fa.method,Q.Factor,p.val) %>%
+#   pivot_wider(.,names_from='Q.Factor',values_from='p.val') %>% dplyr::select(-Gender.numeric,-Education.numeric,-Age)
 
 #write.csv(summary.table,file=file.path(paths$stats,paste0('Revision2_MachineLearning_regression_summary_zscored_TrainWithoutOtherClin_Bartlett.csv')))
 
